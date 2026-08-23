@@ -1,0 +1,4 @@
+# dsh-browser bundle patch: mounts the managed browser driver and its tools.
+- insert:
+    - id: dsh-browser
+      name: '@zseven-w/dsh-browser'

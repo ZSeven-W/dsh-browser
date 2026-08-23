@@ -1,0 +1,78 @@
+{
+  "name": "@zseven-w/dsh-browser",
+  "version": "0.1.0-rc.1",
+  "description": "Headless-first managed Browser Use for DeepSeek Harness with isolated sessions, semantic refs, deterministic safety checks, and bounded evidence",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "browser-use",
+    "playwright",
+    "automation",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./driver": {
+      "types": "./lib/driver-contract.d.ts",
+      "default": "./lib/driver-contract.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "README.*.md",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "smoke:pack": "node test/smoke-pack.mjs",
+    "prepack": "npm run build && npm run typecheck && npm test",
+    "prepublishOnly": "npm run smoke:pack"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^6.0.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "capabilities": [
+      "credential-handling",
+      "env-read",
+      "global-hook",
+      "network-egress",
+      "subprocess",
+      "tool-registration"
+    ]
+  },
+  "dshHostRuntime": {
+    "services": [
+      "tools"
+    ],
+    "typing": "structural"
+  }
+}
