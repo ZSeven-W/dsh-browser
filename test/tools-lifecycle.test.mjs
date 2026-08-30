@@ -16,7 +16,7 @@ function fakeDriver(events = []) {
   const page = { url: 'about:blank', title: '' }
   return {
     kind: 'browser',
-    contractVersion: 1,
+    contractVersion: 2,
     async start(ownerId) {
       events.push(`start:${ownerId}`)
       return {
@@ -56,7 +56,7 @@ function fakeDriver(events = []) {
 }
 
 test('raw tools use full JSON Schema, renderer ContentBlocks, and agent-owned identity', async () => {
-  assert.equal(BROWSER_DRIVER_CONTRACT_VERSION, 1)
+  assert.equal(BROWSER_DRIVER_CONTRACT_VERSION, 2)
   const events = []
   const tools = browserToolList(createBrowserTools(fakeDriver(events)))
   assert.deepEqual(tools.map((tool) => tool.name), BROWSER_TOOL_NAMES)
@@ -112,7 +112,7 @@ test('Cordis mount provides driver, registers five tools, and unloads consumers 
   assert.equal(provided.name, BROWSER_DRIVER_SERVICE)
   assert.equal(provided.value, manager)
   assert.equal(provided.value.kind, 'browser')
-  assert.equal(provided.value.contractVersion, 1)
+  assert.equal(provided.value.contractVersion, 2)
   assert.deepEqual(registered.map((tool) => tool.name), BROWSER_TOOL_NAMES)
   await agentDisposed({ agent: { id: 'agent-a' } })
   assert.ok(events.includes('scope:dispose:agent-a'))
