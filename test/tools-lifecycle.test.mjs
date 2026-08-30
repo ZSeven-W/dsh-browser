@@ -188,3 +188,36 @@ test('installed DSH ToolRuntime registers and executes every definition through 
     assert.equal(Object.isFrozen(result.value), true)
   }
 })
+
+test('browser_act maps scroll, select, and hover arguments to driver actions', async () => {
+  const captured = []
+  const driver = {
+    kind: 'browser',
+    contractVersion: 3,
+    async act(_ownerId, action) {
+      captured.push(action)
+      return {
+        receiptId: 'r', ownerId: 'o', action: action.kind, status: 'confirmed',
+        startedAt: '', completedAt: '', dispatched: true,
+        pageBefore: { url: '', title: '' }, pageAfter: { url: '', title: '' },
+      }
+    },
+  }
+  const tools = createBrowserTools(driver)
+  await tools.browserAct.execute({ action: 'scroll', ref: 'br_x' }, { agent: { id: 'a' } })
+  await tools.browserAct.execute({ action: 'scroll', direction: 'down', amount: 'page' }, { agent: { id: 'a' } })
+  await tools.browserAct.execute({ action: 'scroll', direction: 'up', amount: 120 }, { agent: { id: 'a' } })
+  await tools.browserAct.execute({ action: 'select', ref: 'br_s', option: 'Blue' }, { agent: { id: 'a' } })
+  await tools.browserAct.execute({ action: 'hover', ref: 'br_h' }, { agent: { id: 'a' } })
+  assert.deepEqual(captured, [
+    { kind: 'scroll', ref: 'br_x' },
+    { kind: 'scroll', direction: 'down', amount: 'page' },
+    { kind: 'scroll', direction: 'up', amount: 120 },
+    { kind: 'select', ref: 'br_s', option: 'Blue' },
+    { kind: 'hover', ref: 'br_h' },
+  ])
+  await assert.rejects(tools.browserAct.execute({ action: 'scroll' }, { agent: { id: 'a' } }), /scroll requires ref or direction/)
+  await assert.rejects(tools.browserAct.execute({ action: 'select', ref: 'br_s' }, { agent: { id: 'a' } }), /select requires ref and option/)
+  await assert.rejects(tools.browserAct.execute({ action: 'hover' }, { agent: { id: 'a' } }), /hover requires ref/)
+})
+
