@@ -80,12 +80,12 @@ pnpm run smoke:pack
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 1
+  BROWSER_DRIVER_CONTRACT_VERSION, // 2
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-服务会声明 `kind: "browser"` 和 `contractVersion: 1`。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
+服务会声明 `kind: "browser"` 和 `contractVersion: 2`。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
 
 ## 已验证范围与限制
 
@@ -95,7 +95,7 @@ import {
 
 - 仅支持 Chromium 系浏览器，未实现 Firefox / WebKit。
 - 当前是主文档语义 DOM 投影，未实现跨域 iframe 和 closed shadow root 交互。
-- 此 RC 没有截图、视觉或 OCR 工具。
+- `visualObserve` 只做捕获（像素 + Set-of-Mark 标签）；视觉理解由 DSH Harness 的视觉模型完成。
 - 不读取现有 Profile、Cookie、扩展或已登录 Tab。
 - 已验收路径是 Headless；Headful 参数存在，但尚未获得同等集成覆盖。
 - 确定性风险匹配只是拒绝层，不是完整的用户审批系统；上层 QA 工作流仍需自己的授权策略。
