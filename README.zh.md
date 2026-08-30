@@ -24,7 +24,7 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 | --- | --- |
 | `browser_session_start` | 发现已安装的 Chrome / Edge / Chromium，启动独立 Context。 |
 | `browser_observe` | 返回有界语义视图，以及绑定 epoch / fingerprint / expiry 的 opaque ref。 |
-| `browser_act` | 实时重新解析并校验目标后执行 `click`、`fill`、`press` 或 `navigate`。 |
+| `browser_act` | 实时重新解析并校验目标后执行 `click`、`fill`、`press`、`navigate`、`scroll`、`select` 或 `hover`。 |
 | `browser_evidence` | 返回有界、脱敏的 Console 和 Network 元数据。 |
 | `browser_session_stop` | 关闭 Context，删除对应的精确临时用户目录。 |
 
@@ -34,6 +34,8 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 - `unknown`：动作可能已派发，但取消、导航或运行时异常使最终状态无法确认。
 - `rejected`：策略、过期引用、语义变化或 Hit Test 在派发前拒绝动作。
 - `failed`：浏览器没能派发动作。
+
+`scroll` 可滚动到视口外控件（按 ref，将目标居中）或翻页（`direction` + 可选 `amount`）；`select` 先按可访问标签、再按精确 value 选择原生 `<select>` 选项，无法匹配时直接失败而非猜测；`hover` 将指针停留在元素上，便于后续观察看到悬停才显示的内容。任何已派发的动作（包括 `scroll`）都会使观察失效，因此每次动作后都要重新观察。
 
 ## Operator 导航白名单
 
@@ -80,12 +82,12 @@ pnpm run smoke:pack
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 2
+  BROWSER_DRIVER_CONTRACT_VERSION, // 3
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-服务会声明 `kind: "browser"` 和 `contractVersion: 2`。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
+服务会声明 `kind: "browser"` 和 `contractVersion: 3`。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
 
 ## 已验证范围与限制
 

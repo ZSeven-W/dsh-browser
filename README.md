@@ -24,7 +24,7 @@ The exported `zsevenBrowserDriver` service is the stable orchestration surface i
 | --- | --- |
 | `browser_session_start` | Discover installed Chrome/Edge/Chromium and start one isolated context. |
 | `browser_observe` | Return a bounded semantic view with opaque epoch/fingerprint/expiry-bound refs. |
-| `browser_act` | `click`, `fill`, `press`, or `navigate` after live re-resolution and target checks. |
+| `browser_act` | `click`, `fill`, `press`, `navigate`, `scroll`, `select`, or `hover` after live re-resolution and target checks. |
 | `browser_evidence` | Return bounded, redacted console and network metadata. |
 | `browser_session_stop` | Close the context and delete its exact temporary profile directory. |
 
@@ -34,6 +34,8 @@ Every `browser_act` result is a receipt with one of four states:
 - `unknown`: dispatch may have happened, but cancellation/navigation/runtime failure made the resulting page state uncertain.
 - `rejected`: policy, stale-ref, semantic-change, expiry, or hit-test checks stopped dispatch.
 - `failed`: the browser could not dispatch the action.
+
+`scroll` reaches off-viewport controls (by ref, centering the target) or pages the viewport (`direction` + optional `amount`); `select` chooses a native `<select>` option by accessible label first and exact value second, failing rather than guessing; `hover` holds the pointer over an element so a later observe sees hover-revealed content. Any dispatched action — including `scroll` — invalidates the observation, so observe again after acting.
 
 ## Operator navigation policy
 
@@ -82,12 +84,12 @@ Link or install this directory through the normal DSH local-plugin workflow; no 
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 2
+  BROWSER_DRIVER_CONTRACT_VERSION, // 3
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-The service advertises `kind: "browser"` and `contractVersion: 2`. Its `visualObserve` method captures a bounded PNG plus Set-of-Mark labels for the latest observation; it returns pixels and boxes only — no understanding, OCR, or diffing. Consumers should obtain it with Cordis injection (`ctx.inject([BROWSER_DRIVER_SERVICE], ...)`) and must not import manager internals or share model refs between Agents. `disposeScope(ownerId)` drains a late start as well as an active session; the plugin invokes it from the structural `agent/disposed` lifecycle hook.
+The service advertises `kind: "browser"` and `contractVersion: 3`. Its `visualObserve` method captures a bounded PNG plus Set-of-Mark labels for the latest observation; it returns pixels and boxes only — no understanding, OCR, or diffing. Consumers should obtain it with Cordis injection (`ctx.inject([BROWSER_DRIVER_SERVICE], ...)`) and must not import manager internals or share model refs between Agents. `disposeScope(ownerId)` drains a late start as well as an active session; the plugin invokes it from the structural `agent/disposed` lifecycle hook.
 
 ## Verified scope and current limitations
 
