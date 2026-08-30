@@ -1,7 +1,7 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 1 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 2 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate'
@@ -66,6 +66,97 @@ export interface BrowserObservation {
     maxNodes: number
     maxBytes: number
   }
+}
+
+export interface BrowserFrame {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface BrowserVisualObserveRequest {
+  /**
+   * Exact observation fingerprint from browser_observe in the same Agent
+   * scope. Omit to capture the latest observation.
+   */
+  fingerprint?: string
+  /** Capture the full document instead of the current viewport. Defaults to false. */
+  fullPage?: boolean
+  /** Set-of-Mark budget, clamped to 1..200. Defaults to 80. */
+  maxMarks?: number
+  /** Output scale multiplier applied to the captured PNG, clamped to 1..3. Defaults to 1. */
+  scale?: number
+}
+
+export type BrowserVisualQualityClassification =
+  | 'usable'
+  | 'transparent'
+  | 'mostly-transparent'
+  | 'near-black'
+  | 'near-white'
+  | 'near-uniform'
+
+export interface BrowserVisualQuality {
+  classification: BrowserVisualQualityClassification
+  usable: boolean
+  sampleCount: number
+  visibleFraction: number
+  meanLuminance: number
+  luminanceVariance: number
+  luminanceRange: number
+  darkFraction: number
+  lightFraction: number
+  distinctColorBuckets: number
+}
+
+export interface BrowserVisualMark {
+  /** Set-of-Mark label index, 1-based, matching the source node position. */
+  number: number
+  /** Opaque ref from the source observation. */
+  ref: string
+  /** Stable zero-based index in the source observation's nodes array. */
+  sourceIndex: number
+  /** Top-origin pixels in the native captured PNG (CSS pixels times scale). */
+  nativePixelFrame: BrowserFrame
+}
+
+export interface BrowserVisualOmission {
+  ref: string
+  sourceIndex: number
+  reason: string
+}
+
+export interface BrowserVisualCapture {
+  ownerId: string
+  epoch: number
+  observationFingerprint: string
+  capturedAt: string
+  expiresAt: string
+  page: {
+    url: string
+    title: string
+    viewport: { width: number; height: number }
+  }
+  png: Uint8Array
+  capture: {
+    artifact: {
+      format: 'png'
+      byteLength: number
+      sha256: string
+      /** Absolute path to the PNG in the driver's session temporary area. */
+      path: string
+    }
+    pointFrame: BrowserFrame
+    pixelWidth: number
+    pixelHeight: number
+    scaleX: number
+    scaleY: number
+    fullPage: boolean
+    quality: BrowserVisualQuality
+  }
+  marks: BrowserVisualMark[]
+  omitted: BrowserVisualOmission[]
 }
 
 export type BrowserAction =
@@ -147,6 +238,7 @@ export interface ZSevenBrowserDriver {
   readonly contractVersion: typeof BROWSER_DRIVER_CONTRACT_VERSION
   start(ownerId: string, options?: BrowserSessionStartOptions, signal?: AbortSignal): Promise<BrowserSessionInfo>
   observe(ownerId: string, options?: BrowserObservationOptions, signal?: AbortSignal): Promise<BrowserObservation>
+  visualObserve(ownerId: string, request?: BrowserVisualObserveRequest, signal?: AbortSignal): Promise<BrowserVisualCapture>
   act(ownerId: string, action: BrowserAction, signal?: AbortSignal): Promise<BrowserActionReceipt>
   evidence(ownerId: string, options?: BrowserEvidenceOptions, signal?: AbortSignal): Promise<BrowserEvidence>
   stop(ownerId: string): Promise<BrowserSessionStopResult>

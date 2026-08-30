@@ -8,6 +8,7 @@ export * from './manager.js'
 export * from './risk.js'
 export * from './semantic.js'
 export * from './tools.js'
+export * from './visual.js'
 
 export const name = 'dsh-browser'
 export const inject = ['tools']

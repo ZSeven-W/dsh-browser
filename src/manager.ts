@@ -1,5 +1,5 @@
-import { randomBytes, randomUUID } from 'node:crypto'
-import { access, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -8,16 +8,21 @@ import { discoverInstalledBrowser, type BrowserExecutable } from './browser-disc
 import type {
   BrowserAction,
   BrowserActionReceipt,
+  BrowserConsoleEvidence,
   BrowserEvidence,
   BrowserEvidenceOptions,
+  BrowserFrame,
   BrowserNetworkEvidence,
   BrowserObservation,
   BrowserObservationOptions,
   BrowserSessionInfo,
   BrowserSessionStartOptions,
   BrowserSessionStopResult,
+  BrowserVisualCapture,
+  BrowserVisualMark,
+  BrowserVisualObserveRequest,
+  BrowserVisualOmission,
   ZSevenBrowserDriver,
-  BrowserConsoleEvidence,
 } from './driver-contract.js'
 import { BROWSER_DRIVER_CONTRACT_VERSION } from './driver-contract.js'
 import { classifyActionRisk, normalizeNavigationUrl } from './risk.js'
@@ -31,12 +36,18 @@ import {
   type RawSemanticCandidate,
   type StoredSemanticTarget,
 } from './semantic.js'
+import { analyzePng, measureSemanticBoxes } from './visual.js'
 
 const DEFAULT_OBSERVATION_TTL_MS = 30_000
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000
 const DEFAULT_ACTION_TIMEOUT_MS = 15_000
 const MAX_OBSERVATION_BYTES = 48 * 1024
 const MAX_EVIDENCE_RING = 200
+const DEFAULT_MAX_CAPTURE_PIXELS = 4096 * 4096
+const DEFAULT_MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+const MAX_CAPTURE_SCALE = 3
+const MAX_MARKS = 200
+const DEFAULT_MARKS = 80
 
 type PersistentContextOptions = NonNullable<Parameters<typeof chromium.launchPersistentContext>[1]>
 type PersistentLauncher = (userDataDir: string, options: PersistentContextOptions) => Promise<BrowserContext>
@@ -48,6 +59,10 @@ export interface BrowserManagerOptions {
   actionTimeoutMs?: number
   /** Operator-owned exact http(s) origins. Undefined means unrestricted; [] denies all web navigation. */
   allowedOrigins?: readonly string[]
+  /** Maximum visual capture size in pixels (width x height). Defaults to 4096^2. */
+  maxCapturePixels?: number
+  /** Maximum visual capture size in PNG bytes. Defaults to 16 MiB. */
+  maxCaptureBytes?: number
   now?: () => number
   discoverBrowser?: () => Promise<BrowserExecutable>
   launchPersistentContext?: PersistentLauncher
@@ -199,6 +214,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
   readonly #idleTimeoutMs: number
   readonly #actionTimeoutMs: number
   readonly #allowedOrigins: ReadonlySet<string> | undefined
+  readonly #maxCapturePixels: number
+  readonly #maxCaptureBytes: number
   readonly #now: () => number
   readonly #discoverBrowser: () => Promise<BrowserExecutable>
   readonly #launch: PersistentLauncher
@@ -213,6 +230,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
     this.#allowedOrigins = options.allowedOrigins === undefined
       ? undefined
       : new Set(options.allowedOrigins.map(normalizePolicyOrigin))
+    this.#maxCapturePixels = clampInt(options.maxCapturePixels, DEFAULT_MAX_CAPTURE_PIXELS, 1, 512 * 1024 * 1024)
+    this.#maxCaptureBytes = clampInt(options.maxCaptureBytes, DEFAULT_MAX_CAPTURE_BYTES, 1, 512 * 1024 * 1024)
     this.#now = options.now ?? Date.now
     this.#discoverBrowser = options.discoverBrowser ?? (() => discoverInstalledBrowser())
     this.#launch = options.launchPersistentContext
@@ -411,6 +430,137 @@ export class BrowserManager implements ZSevenBrowserDriver {
         nodes: targets.map(publicSemanticNode),
         truncated: raw.length > targets.length || raw.length >= 500,
         limits: { maxNodes, maxBytes: MAX_OBSERVATION_BYTES },
+      }
+    })
+  }
+
+  async visualObserve(ownerId: string, request: BrowserVisualObserveRequest = {}, signal?: AbortSignal): Promise<BrowserVisualCapture> {
+    const owner = validateOwner(ownerId)
+    return this.#exclusive(owner, signal, async (session) => {
+      const observation = session.observation
+      if (!observation) throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe before requesting a visual capture', true)
+      if (this.#now() > observation.expiresAtMs) throw new DriverIssue('REF_EXPIRED', 'the semantic observation expired; observe again before visual capture', true)
+      if (session.page.url() !== observation.rawUrl) throw new DriverIssue('PAGE_CHANGED', 'the page URL changed after observation; observe again before visual capture', true)
+      if (request.fingerprint !== undefined && request.fingerprint !== observation.fingerprint) {
+        throw new DriverIssue('OBSERVATION_STALE', 'the requested observation fingerprint is not the latest observation; observe again', true)
+      }
+      const fullPage = request.fullPage === true
+      const scale = clampInt(request.scale, 1, 1, MAX_CAPTURE_SCALE)
+      const maxMarks = clampInt(request.maxMarks, DEFAULT_MARKS, 1, MAX_MARKS)
+      const targets = [...observation.targets.values()]
+
+      if (fullPage) {
+        await this.#abortClosesSession(session, signal, session.page.evaluate(() => { window.scrollTo(0, 0) }))
+      }
+      const measured = await this.#abortClosesSession(session, signal, measureSemanticBoxes(session.page, targets.map((target) => target.selector)))
+      const viewport = session.page.viewportSize() ?? { width: 0, height: 0 }
+      const captureWidth = fullPage ? measured.docWidth : viewport.width
+      const captureHeight = fullPage ? measured.docHeight : viewport.height
+      if (captureWidth <= 0 || captureHeight <= 0) throw new DriverIssue('CAPTURE_EMPTY', 'the page has no renderable area to capture', true)
+      const pixelWidth = Math.ceil(captureWidth * scale)
+      const pixelHeight = Math.ceil(captureHeight * scale)
+      const totalPixels = pixelWidth * pixelHeight
+      if (totalPixels > this.#maxCapturePixels) {
+        throw new DriverIssue(
+          'CAPTURE_TOO_LARGE',
+          `capture would be ${pixelWidth}x${pixelHeight} (${totalPixels} px), exceeding the ${this.#maxCapturePixels} px budget; reduce scale or capture the viewport only`,
+          true,
+        )
+      }
+
+      const png = await this.#abortClosesSession(session, signal, this.#capturePng(session, fullPage, captureWidth, captureHeight, scale))
+      if (png.byteLength > this.#maxCaptureBytes) {
+        throw new DriverIssue('CAPTURE_TOO_LARGE', `capture produced ${png.byteLength} bytes, exceeding the ${this.#maxCaptureBytes} byte budget`, true)
+      }
+      const analysis = analyzePng(png)
+      const artifactPath = await this.#writeCaptureFile(session, png)
+
+      const marks: BrowserVisualMark[] = []
+      const omitted: BrowserVisualOmission[] = []
+      for (const [index, target] of targets.entries()) {
+        const row = measured.rows[index]
+        let omitReason: string | undefined
+        let markBox: BrowserFrame | undefined
+        if (!row) {
+          omitReason = 'not-found'
+        } else if (!row.found) {
+          omitReason = 'not-found'
+        } else if (!row.connected) {
+          omitReason = 'detached'
+        } else if (row.hidden) {
+          omitReason = 'hidden'
+        } else if (row.zeroSize) {
+          omitReason = 'zero-size'
+        } else if (!fullPage && !row.inViewport) {
+          omitReason = 'off-viewport'
+        } else if (fullPage && !row.inDocument) {
+          omitReason = 'off-page'
+        } else if (row.occluded) {
+          omitReason = 'occluded'
+        } else {
+          const css = fullPage ? row.box : row.viewportBox
+          const x = Math.max(0, Math.min(captureWidth, css.x))
+          const y = Math.max(0, Math.min(captureHeight, css.y))
+          const right = Math.max(x, Math.min(captureWidth, css.x + css.width))
+          const bottom = Math.max(y, Math.min(captureHeight, css.y + css.height))
+          if (right - x <= 0 || bottom - y <= 0) {
+            omitReason = fullPage ? 'off-page' : 'off-viewport'
+          } else {
+            markBox = { x, y, width: right - x, height: bottom - y }
+          }
+        }
+        if (omitReason !== undefined) {
+          omitted.push({ ref: target.ref, sourceIndex: index, reason: omitReason })
+        } else if (marks.length < maxMarks) {
+          const box = markBox as BrowserFrame
+          marks.push({
+            number: index + 1,
+            ref: target.ref,
+            sourceIndex: index,
+            nativePixelFrame: {
+              x: box.x * scale,
+              y: box.y * scale,
+              width: box.width * scale,
+              height: box.height * scale,
+            },
+          })
+        } else {
+          omitted.push({ ref: target.ref, sourceIndex: index, reason: 'mark-budget-exceeded' })
+        }
+      }
+
+      const capturedAtMs = this.#now()
+      const title = compact(await session.page.title().catch(() => ''), 300)
+      this.#touch(session)
+      return {
+        ownerId: owner,
+        epoch: observation.epoch,
+        observationFingerprint: observation.fingerprint,
+        capturedAt: iso(capturedAtMs),
+        expiresAt: iso(observation.expiresAtMs),
+        page: {
+          url: publicPageUrl(observation.rawUrl),
+          title,
+          viewport: { width: viewport.width, height: viewport.height },
+        },
+        png: new Uint8Array(png),
+        capture: {
+          artifact: {
+            format: 'png',
+            byteLength: png.byteLength,
+            sha256: createHash('sha256').update(png).digest('hex'),
+            path: artifactPath,
+          },
+          pointFrame: { x: 0, y: 0, width: captureWidth, height: captureHeight },
+          pixelWidth: analysis.width,
+          pixelHeight: analysis.height,
+          scaleX: analysis.width / captureWidth,
+          scaleY: analysis.height / captureHeight,
+          fullPage,
+          quality: analysis.quality,
+        },
+        marks,
+        omitted,
       }
     })
   }
@@ -689,6 +839,34 @@ export class BrowserManager implements ZSevenBrowserDriver {
       return top !== null && (top === element || element.contains(top) || top.contains(element))
     }).catch(() => false)
     if (!hit) throw new DriverIssue('TARGET_OCCLUDED', 'center-point hit-test did not resolve to the live target', true)
+  }
+
+  async #capturePng(session: ManagedSession, fullPage: boolean, width: number, height: number, scale: number): Promise<Buffer> {
+    if (scale === 1) {
+      return session.page.screenshot({ type: 'png', fullPage })
+    }
+    // Numeric scale is honored through CDP so the PNG is genuinely rendered at
+    // the requested device pixel ratio, and mark frames are reported in those
+    // native pixels. Playwright's own screenshot only supports 1x vs device.
+    const cdp = await session.context.newCDPSession(session.page)
+    try {
+      const result = await cdp.send('Page.captureScreenshot', {
+        format: 'png',
+        ...(fullPage ? { captureBeyondViewport: true } : {}),
+        clip: { x: 0, y: 0, width, height, scale },
+      })
+      return Buffer.from(result.data as string, 'base64')
+    } finally {
+      await cdp.detach().catch(() => {})
+    }
+  }
+
+  async #writeCaptureFile(session: ManagedSession, png: Buffer): Promise<string> {
+    const capturesDir = join(session.userDataDir, 'captures')
+    await mkdir(capturesDir, { recursive: true })
+    const path = join(capturesDir, `visual-${session.epoch}-${randomUUID()}.png`)
+    await writeFile(path, png)
+    return path
   }
 
   #attachPage(session: ManagedSession, page: Page): void {
