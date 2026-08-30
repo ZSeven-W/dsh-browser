@@ -592,8 +592,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
       let reason: string | undefined
 
       try {
-        if (!action || !['click', 'fill', 'press', 'navigate'].includes(action.kind)) {
-          throw new DriverIssue('ACTION_INVALID', 'action kind must be click, fill, press, or navigate', true)
+        if (!action || !['click', 'fill', 'press', 'navigate', 'scroll', 'select', 'hover'].includes(action.kind)) {
+          throw new DriverIssue('ACTION_INVALID', 'action kind must be click, fill, press, navigate, scroll, select, or hover', true)
         }
         if (action.kind === 'navigate') {
           const decision = classifyActionRisk(action)
@@ -609,55 +609,174 @@ export class BrowserManager implements ZSevenBrowserDriver {
           this.#assertAllowedUrl(active.page.url())
           status = 'confirmed'
           verification = { kind: 'navigation', detail: 'browser reported DOMContentLoaded for the validated destination' }
+        } else if (action.kind === 'scroll' && !('ref' in action)) {
+          // Viewport scroll without a target, for exploratory paging.
+          if (action.direction !== 'up' && action.direction !== 'down') {
+            throw new DriverIssue('SCROLL_DIRECTION_INVALID', 'scroll direction must be "up" or "down"', true)
+          }
+          const amount = action.amount === undefined ? 'page' : action.amount
+          if (amount !== 'page' && (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0)) {
+            throw new DriverIssue('SCROLL_AMOUNT_INVALID', 'scroll amount must be "page" or a non-negative pixel count', true)
+          }
+          const before = await this.#abortClosesSession(active, signal, active.page.evaluate(() => window.scrollY))
+          dispatched = true
+          const after = await this.#abortClosesSession(active, signal, active.page.evaluate(({ direction, amount }) => {
+            const delta = amount === 'page' ? window.innerHeight : amount
+            window.scrollBy(0, direction === 'up' ? -delta : delta)
+            return window.scrollY
+          }, { direction: action.direction, amount }))
+          status = 'confirmed'
+          verification = {
+            kind: 'browser-dispatch',
+            detail: `viewport scroll ${action.direction} by ${amount === 'page' ? 'one page' : `${amount}px`} (scrollY ${before} -> ${after})`,
+          }
+          await delay(100)
+          if (active.closed) throw new DriverIssue('SESSION_CLOSED_AFTER_ACTION', 'the session closed fail-closed during action navigation', true)
+          this.#assertAllowedUrl(active.page.url())
         } else {
           if (typeof action.ref !== 'string' || action.ref.length > 128) {
             throw new DriverIssue('REF_INVALID', 'ref must be a short opaque reference from browser_observe', true)
           }
-          const resolved = await this.#resolveTarget(active, action.ref, signal)
+          // A scroll that cannot resolve its ref is a capability failure, not
+          // a policy refusal: the browser genuinely could not scroll to it.
+          const resolved = await this.#resolveTarget(active, action.ref, signal, action.kind !== 'scroll')
           try {
             targetResult = { ref: action.ref, role: resolved.target.role, name: resolved.target.name }
             const observed = active.observation
             if (observed) observationResult = { epoch: observed.epoch, fingerprint: observed.fingerprint }
-            if (!resolved.target.interactive) throw new DriverIssue('TARGET_NOT_INTERACTIVE', 'the live target is not semantically interactive', true)
-            if (resolved.target.disabled) throw new DriverIssue('TARGET_DISABLED', 'the live target is disabled', true)
-            if (action.kind === 'fill' && !resolved.target.editable) throw new DriverIssue('TARGET_NOT_EDITABLE', 'fill requires a live editable target', true)
-            if (action.kind === 'fill' && (typeof action.text !== 'string' || action.text.length > 10_000)) {
-              throw new DriverIssue('TEXT_INVALID', 'fill text must be a string of at most 10000 characters', true)
-            }
-            if (action.kind === 'press' && (typeof action.key !== 'string' || action.key.trim() === '' || action.key.length > 80)) {
-              throw new DriverIssue('KEY_INVALID', 'press key must be a non-empty Playwright key of at most 80 characters', true)
-            }
-            const decision = classifyActionRisk(action, resolved.target)
-            if (!decision.allowed) throw new DriverIssue(decision.code, decision.reason, true)
-            if (action.kind === 'click' && resolved.target.href !== undefined && !this.#originAllowed(resolved.target.href)) {
-              this.#scheduleClose(active)
-              throw new DriverIssue('ORIGIN_POLICY_VIOLATION', 'link target origin is outside the operator-owned allowlist', true)
-            }
-
-            await this.#hitTest(resolved.handle)
-            dispatched = true
-            if (action.kind === 'click') {
-              await this.#abortClosesSession(active, signal, resolved.handle.click({ timeout: this.#actionTimeoutMs }))
-              verification = { kind: 'browser-dispatch', detail: 'Playwright completed click on the same bound backend node used for risk and hit-test' }
-              status = 'confirmed'
-            } else if (action.kind === 'fill') {
-              await this.#abortClosesSession(active, signal, resolved.handle.fill(action.text, { timeout: this.#actionTimeoutMs }))
-              const liveValue = await resolved.handle.inputValue()
-              status = liveValue === action.text ? 'confirmed' : 'failed'
-              verification = {
-                kind: 'value-match',
-                detail: liveValue === action.text
-                  ? `live value matched on the bound backend node (${action.text.length} characters; value omitted)`
-                  : `live value did not match requested length ${action.text.length} (values omitted)`,
-              }
-              if (status === 'failed') {
-                code = 'VALUE_MISMATCH'
-                reason = 'the editable target did not retain the requested value'
+            if (action.kind === 'scroll') {
+              // Positional: no interactivity, disabled, risk, or hit-test gate.
+              dispatched = true
+              await this.#abortClosesSession(active, signal, resolved.handle.evaluate((element) => {
+                element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })
+              }))
+              const inView = await resolved.handle.evaluate((element) => {
+                if (!element.isConnected) return false
+                const rect = element.getBoundingClientRect()
+                return rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
+              })
+              if (!inView) {
+                status = 'failed'
+                code = 'SCROLL_TARGET_UNREACHABLE'
+                reason = 'the referenced element could not be scrolled into the viewport'
+                verification = { kind: 'browser-dispatch', detail: 'scroll command completed but the element did not intersect the viewport' }
+              } else {
+                status = 'confirmed'
+                verification = { kind: 'browser-dispatch', detail: 'scrolled the bound backend node into view (center) and verified it intersects the viewport' }
               }
             } else {
-              await this.#abortClosesSession(active, signal, resolved.handle.press(action.key, { timeout: this.#actionTimeoutMs }))
-              verification = { kind: 'browser-dispatch', detail: 'Playwright completed key dispatch on the same bound backend node used for risk and hit-test' }
-              status = 'confirmed'
+              if (!resolved.target.interactive) throw new DriverIssue('TARGET_NOT_INTERACTIVE', 'the live target is not semantically interactive', true)
+              if (resolved.target.disabled) throw new DriverIssue('TARGET_DISABLED', 'the live target is disabled', true)
+              if (action.kind === 'fill' && !resolved.target.editable) throw new DriverIssue('TARGET_NOT_EDITABLE', 'fill requires a live editable target', true)
+              if (action.kind === 'fill' && (typeof action.text !== 'string' || action.text.length > 10_000)) {
+                throw new DriverIssue('TEXT_INVALID', 'fill text must be a string of at most 10000 characters', true)
+              }
+              if (action.kind === 'press' && (typeof action.key !== 'string' || action.key.trim() === '' || action.key.length > 80)) {
+                throw new DriverIssue('KEY_INVALID', 'press key must be a non-empty Playwright key of at most 80 characters', true)
+              }
+              if (action.kind === 'select' && resolved.target.tag !== 'select') {
+                throw new DriverIssue('SELECT_NOT_SELECT', 'select requires a live native <select> target', false)
+              }
+              if (action.kind === 'select' && (typeof action.option !== 'string' || action.option.trim() === '' || action.option.length > 1000)) {
+                throw new DriverIssue('OPTION_INVALID', 'select option must be a non-empty string of at most 1000 characters', true)
+              }
+              const decision = classifyActionRisk(action, resolved.target)
+              if (!decision.allowed) throw new DriverIssue(decision.code, decision.reason, true)
+              if (action.kind === 'click' && resolved.target.href !== undefined && !this.#originAllowed(resolved.target.href)) {
+                this.#scheduleClose(active)
+                throw new DriverIssue('ORIGIN_POLICY_VIOLATION', 'link target origin is outside the operator-owned allowlist', true)
+              }
+
+              await this.#hitTest(resolved.handle)
+              if (action.kind === 'click') {
+                dispatched = true
+                await this.#abortClosesSession(active, signal, resolved.handle.click({ timeout: this.#actionTimeoutMs }))
+                verification = { kind: 'browser-dispatch', detail: 'Playwright completed click on the same bound backend node used for risk and hit-test' }
+                status = 'confirmed'
+              } else if (action.kind === 'fill') {
+                dispatched = true
+                await this.#abortClosesSession(active, signal, resolved.handle.fill(action.text, { timeout: this.#actionTimeoutMs }))
+                const liveValue = await resolved.handle.inputValue()
+                status = liveValue === action.text ? 'confirmed' : 'failed'
+                verification = {
+                  kind: 'value-match',
+                  detail: liveValue === action.text
+                    ? `live value matched on the bound backend node (${action.text.length} characters; value omitted)`
+                    : `live value did not match requested length ${action.text.length} (values omitted)`,
+                }
+                if (status === 'failed') {
+                  code = 'VALUE_MISMATCH'
+                  reason = 'the editable target did not retain the requested value'
+                }
+              } else if (action.kind === 'press') {
+                dispatched = true
+                await this.#abortClosesSession(active, signal, resolved.handle.press(action.key, { timeout: this.#actionTimeoutMs }))
+                verification = { kind: 'browser-dispatch', detail: 'Playwright completed key dispatch on the same bound backend node used for risk and hit-test' }
+                status = 'confirmed'
+              } else if (action.kind === 'select') {
+                const match = await resolved.handle.evaluate((element, wanted) => {
+                  const normalize = (value: string | null | undefined): string => String(value ?? '').replace(/\s+/gu, ' ').trim()
+                  const options = Array.from((element as HTMLSelectElement).options)
+                  const labelMatches: number[] = []
+                  const valueMatches: number[] = []
+                  for (let index = 0; index < options.length; index += 1) {
+                    const option = options[index] as HTMLOptionElement
+                    const label = normalize(option.getAttribute('label') ?? option.textContent ?? '')
+                    if (label === wanted) labelMatches.push(index)
+                    if (option.value === wanted) valueMatches.push(index)
+                  }
+                  let kind: 'label' | 'value' | 'ambiguous-label' | 'ambiguous-value' | 'missing' = 'missing'
+                  let index = -1
+                  let count = 0
+                  if (labelMatches.length === 1) {
+                    kind = 'label'
+                    index = labelMatches[0] ?? -1
+                  } else if (labelMatches.length > 1) {
+                    kind = 'ambiguous-label'
+                    count = labelMatches.length
+                  } else if (valueMatches.length === 1) {
+                    kind = 'value'
+                    index = valueMatches[0] ?? -1
+                  } else if (valueMatches.length > 1) {
+                    kind = 'ambiguous-value'
+                    count = valueMatches.length
+                  }
+                  return { kind, index, count }
+                }, action.option)
+                if (match.kind === 'missing') {
+                  status = 'failed'
+                  code = 'SELECT_OPTION_MISSING'
+                  reason = `option "${action.option}" matches no option label or value`
+                  verification = { kind: 'option-match', detail: 'no option label or value matched the requested option' }
+                } else if (match.kind === 'ambiguous-label' || match.kind === 'ambiguous-value') {
+                  status = 'failed'
+                  code = 'SELECT_OPTION_AMBIGUOUS'
+                  reason = `option "${action.option}" matches ${match.count} options by ${match.kind === 'ambiguous-label' ? 'label' : 'value'}; use a unique label or value`
+                  verification = { kind: 'option-match', detail: 'multiple options matched the requested option' }
+                } else {
+                  dispatched = true
+                  await this.#abortClosesSession(active, signal, resolved.handle.selectOption({ index: match.index }))
+                  const selected = await resolved.handle.evaluate((element, index) => {
+                    const select = element as HTMLSelectElement
+                    const option = select.options[index]
+                    return option !== undefined && option.selected === true && select.value === option.value
+                  }, match.index)
+                  if (selected) {
+                    status = 'confirmed'
+                    verification = { kind: 'option-match', detail: `selected the option matched by ${match.kind} on the bound select` }
+                  } else {
+                    status = 'failed'
+                    code = 'OPTION_MISMATCH'
+                    reason = 'the select did not retain the chosen option'
+                    verification = { kind: 'option-match', detail: 'the native select did not retain the chosen option' }
+                  }
+                }
+              } else {
+                dispatched = true
+                await this.#abortClosesSession(active, signal, resolved.handle.hover({ timeout: this.#actionTimeoutMs }))
+                verification = { kind: 'browser-dispatch', detail: 'Playwright completed hover on the same bound backend node used for risk and hit-test; the pointer stays over the element' }
+                status = 'confirmed'
+              }
             }
             // Let popup/navigation policy handlers run before confirming the
             // session remains controllable.
@@ -793,13 +912,13 @@ export class BrowserManager implements ZSevenBrowserDriver {
     return waitForAbortable(operation, signal, () => { this.#scheduleClose(session) })
   }
 
-  async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
+  async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal, failureRejected = true): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
     const observation = session.observation
-    if (!observation) throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', true)
-    if (this.#now() > observation.expiresAtMs) throw new DriverIssue('REF_EXPIRED', 'the semantic ref expired; observe again', true)
-    if (session.page.url() !== observation.rawUrl) throw new DriverIssue('PAGE_CHANGED', 'the page URL changed after observation; observe again', true)
+    if (!observation) throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', failureRejected)
+    if (this.#now() > observation.expiresAtMs) throw new DriverIssue('REF_EXPIRED', 'the semantic ref expired; observe again', failureRejected)
+    if (session.page.url() !== observation.rawUrl) throw new DriverIssue('PAGE_CHANGED', 'the page URL changed after observation; observe again', failureRejected)
     const stored = observation.targets.get(ref)
-    if (!stored) throw new DriverIssue('REF_UNKNOWN', 'the ref is not part of the latest observation', true)
+    if (!stored) throw new DriverIssue('REF_UNKNOWN', 'the ref is not part of the latest observation', failureRejected)
     const candidates = await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))
     const withFingerprints = candidates.map((candidate) => ({ candidate, fingerprint: semanticFingerprint(candidate) }))
     const sameSelector = withFingerprints.find((entry) => entry.candidate.selector === stored.selector)
@@ -808,20 +927,20 @@ export class BrowserManager implements ZSevenBrowserDriver {
       live = sameSelector.candidate
     } else {
       const matches = withFingerprints.filter((entry) => entry.fingerprint === stored.fingerprint)
-      if (matches.length > 1) throw new DriverIssue('TARGET_AMBIGUOUS', 'multiple live elements now match the observed target; observe again', true)
+      if (matches.length > 1) throw new DriverIssue('TARGET_AMBIGUOUS', 'multiple live elements now match the observed target; observe again', failureRejected)
       live = matches[0]?.candidate
     }
-    if (!live) throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', true)
+    if (!live) throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected)
     const handle = await this.#abortClosesSession(
       session,
       signal,
       session.page.locator(live.selector).first().elementHandle(),
     )
-    if (!handle) throw new DriverIssue('TARGET_DETACHED', 'the live element detached before it could be bound', true)
+    if (!handle) throw new DriverIssue('TARGET_DETACHED', 'the live element detached before it could be bound', failureRejected)
     const bound = await inspectSemanticHandle(handle, live.selector).catch(() => null)
     if (!bound || semanticFingerprint(bound) !== stored.fingerprint) {
       await handle.dispose().catch(() => {})
-      throw new DriverIssue('TARGET_CHANGED', 'the bound backend node no longer matches the observed semantic fingerprint', true)
+      throw new DriverIssue('TARGET_CHANGED', 'the bound backend node no longer matches the observed semantic fingerprint', failureRejected)
     }
     return { target: bound, handle }
   }

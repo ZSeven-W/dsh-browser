@@ -77,8 +77,9 @@ const semanticNodeSchema = closedObject({
   interactive: { type: 'boolean' },
   editable: { type: 'boolean' },
   disabled: { type: 'boolean' },
+  inViewport: { type: 'boolean' },
   href: { type: 'string' },
-}, ['ref', 'role', 'name', 'tag', 'interactive', 'editable', 'disabled'])
+}, ['ref', 'role', 'name', 'tag', 'interactive', 'editable', 'disabled', 'inViewport'])
 const observationSchema = closedObject({
   ownerId: { type: 'string' },
   epoch: { type: 'integer' },
@@ -96,7 +97,7 @@ const observationSchema = closedObject({
 const actionReceiptSchema = closedObject({
   receiptId: { type: 'string' },
   ownerId: { type: 'string' },
-  action: { type: 'string', enum: ['click', 'fill', 'press', 'navigate'] },
+  action: { type: 'string', enum: ['click', 'fill', 'press', 'navigate', 'scroll', 'select', 'hover'] },
   status: { type: 'string', enum: ['confirmed', 'unknown', 'rejected', 'failed'] },
   startedAt: { type: 'string' },
   completedAt: { type: 'string' },
@@ -106,7 +107,7 @@ const actionReceiptSchema = closedObject({
   target: closedObject({ ref: { type: 'string' }, role: { type: 'string' }, name: { type: 'string' } }),
   observation: closedObject({ epoch: { type: 'integer' }, fingerprint: { type: 'string' } }),
   verification: closedObject({
-    kind: { type: 'string', enum: ['browser-dispatch', 'value-match', 'navigation'] },
+    kind: { type: 'string', enum: ['browser-dispatch', 'value-match', 'navigation', 'option-match'] },
     detail: { type: 'string' },
   }),
   code: { type: 'string' },
@@ -207,24 +208,30 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
   })
 
   const browserAct = tool<{
-    action: 'click' | 'fill' | 'press' | 'navigate'
+    action: 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
     ref?: string
     text?: string
     key?: string
     url?: string
+    direction?: 'up' | 'down'
+    amount?: 'page' | number
+    option?: string
   }, BrowserActionReceipt>({
     name: 'browser_act',
-    description: 'Perform exactly one browser action. click/fill/press require a ref from the latest browser_observe; the driver live re-resolves and hit-tests it. Deterministic policy rejects destructive, financial, publish/send, credential, file-upload, and download semantics. Every call returns a confirmed/unknown/rejected/failed receipt.',
+    description: 'Perform exactly one browser action. click/fill/press/scroll(ref)/select/hover require a ref from the latest browser_observe; the driver live re-resolves and hit-tests it (scroll resolves without a hit-test so it can reach off-viewport targets). scroll(direction) pages the viewport without a ref. select fires real input/change events and matches an option by accessible label first and exact value second, failing (not guessing) when ambiguous or missing. Every action invalidates the observation, so observe again after acting. Deterministic policy rejects destructive, financial, publish/send, credential, file-upload, and download semantics. Every call returns a confirmed/unknown/rejected/failed receipt.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['click', 'fill', 'press', 'navigate'] },
-        ref: { type: 'string', description: 'Opaque ref required for click, fill, and press.' },
+        action: { type: 'string', enum: ['click', 'fill', 'press', 'navigate', 'scroll', 'select', 'hover'] },
+        ref: { type: 'string', description: 'Opaque ref required for click, fill, press, scroll(ref), select, and hover.' },
         text: { type: 'string', description: 'Text required for fill; never echoed in receipts.' },
         key: { type: 'string', description: 'Playwright key name/chord required for press.' },
         url: { type: 'string', description: 'Absolute http(s) URL required for navigate.' },
+        direction: { type: 'string', enum: ['up', 'down'], description: 'Direction for a ref-less viewport scroll.' },
+        amount: { description: 'Scroll amount for a direction scroll: "page" (one viewport height) or a non-negative pixel count. Defaults to "page".', oneOf: [{ type: 'string', const: 'page' }, { type: 'number', minimum: 0 }] },
+        option: { type: 'string', description: 'Option label or value required for select; matched by label first, then value.' },
       },
     },
     output: outputFor(actionReceiptSchema),
@@ -244,8 +251,22 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
       } else if (args.action === 'navigate') {
         if (args.url === undefined) throw new Error('browser_act navigate requires url')
         action = { kind: 'navigate', url: args.url }
+      } else if (args.action === 'scroll') {
+        if (args.ref !== undefined) {
+          action = { kind: 'scroll', ref: args.ref }
+        } else if (args.direction !== undefined) {
+          action = { kind: 'scroll', direction: args.direction, ...(args.amount === undefined ? {} : { amount: args.amount }) }
+        } else {
+          throw new Error('browser_act scroll requires ref or direction')
+        }
+      } else if (args.action === 'select') {
+        if (args.ref === undefined || args.option === undefined) throw new Error('browser_act select requires ref and option')
+        action = { kind: 'select', ref: args.ref, option: args.option }
+      } else if (args.action === 'hover') {
+        if (args.ref === undefined) throw new Error('browser_act hover requires ref')
+        action = { kind: 'hover', ref: args.ref }
       } else {
-        throw new Error('browser_act action must be click, fill, press, or navigate')
+        throw new Error('browser_act action must be click, fill, press, navigate, scroll, select, or hover')
       }
       return driver.act(ownerFromExec(exec), action, exec.signal)
     },

@@ -1,10 +1,10 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 2 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 3 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
-export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate'
+export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
 
 export interface BrowserSessionStartOptions {
   /** Initial http(s) URL. Omit to start at about:blank. */
@@ -46,6 +46,12 @@ export interface BrowserSemanticNode {
   interactive: boolean
   editable: boolean
   disabled: boolean
+  /**
+   * Whether the element's box currently intersects the viewport. Off-viewport
+   * nodes still carry a ref so `scroll` can reach them, but they are omitted
+   * from a viewport `visualObserve` capture with reason `off-viewport`.
+   */
+  inViewport: boolean
   /** Query strings and fragments are removed. */
   href?: string
 }
@@ -164,6 +170,36 @@ export type BrowserAction =
   | { kind: 'fill'; ref: string; text: string }
   | { kind: 'press'; ref: string; key: string }
   | { kind: 'navigate'; url: string }
+  /**
+   * Scroll the referenced element into view (center-ish). This is the primary
+   * form for reaching off-viewport controls. Scrolling mutates the viewport,
+   * so — like every dispatched action — it invalidates the current
+   * observation: observe again after scrolling to obtain fresh refs. A scroll
+   * to an unreachable or detached ref fails (not rejects) with a reason.
+   */
+  | { kind: 'scroll'; ref: string }
+  /**
+   * Viewport scroll without a target, for exploratory paging. `amount`
+   * defaults to `'page'` (one viewport height); a number scrolls that many CSS
+   * pixels in the given direction. Scrolling mutates the viewport, so it
+   * invalidates the current observation: observe again after scrolling.
+   */
+  | { kind: 'scroll'; direction: 'up' | 'down'; amount?: 'page' | number }
+  /**
+   * Select an option in a native `<select>`. The option is matched by
+   * accessible label first, then by exact value; an ambiguous or missing
+   * option fails with a clear reason instead of guessing. Selection uses the
+   * underlying browser's native select mechanism so the page observes real
+   * `input`/`change` events, never a JS value assignment.
+   */
+  | { kind: 'select'; ref: string; option: string }
+  /**
+   * Move the pointer over the element and keep the page in that hover state
+   * long enough for a subsequent observe to see hover-revealed content. The
+   * hover state persists until a later pointer-moving action (for example a
+   * click on another element) moves the pointer away.
+   */
+  | { kind: 'hover'; ref: string }
 
 export interface BrowserActionReceipt {
   receiptId: string
@@ -186,7 +222,7 @@ export interface BrowserActionReceipt {
     fingerprint: string
   }
   verification?: {
-    kind: 'browser-dispatch' | 'value-match' | 'navigation'
+    kind: 'browser-dispatch' | 'value-match' | 'navigation' | 'option-match'
     detail: string
   }
   code?: string

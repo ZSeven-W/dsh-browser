@@ -17,6 +17,8 @@ export interface RawSemanticCandidate {
   interactive: boolean
   editable: boolean
   disabled: boolean
+  /** Whether the element's box intersects the viewport at collection time. Not part of the identity fingerprint. */
+  inViewport: boolean
   download: boolean
   href?: string
 }
@@ -66,6 +68,7 @@ export function publicSemanticNode(target: StoredSemanticTarget): BrowserSemanti
     interactive: target.interactive,
     editable: target.editable,
     disabled: target.disabled,
+    inViewport: target.inViewport,
     ...(target.href === undefined ? {} : { href: target.href }),
   }
 }
@@ -162,10 +165,11 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       const interactive = editable || ['a', 'button', 'select', 'summary'].includes(tag)
         || element.hasAttribute('tabindex') || role !== 'generic' && role !== 'heading'
       const disabled = element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true'
+      const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
       const href = safeHref(element)
       output.push({
         selector: selectorFor(element), role, name: accessibleName(element), tag, inputType,
-        interactive, editable, disabled,
+        interactive, editable, disabled, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
       })
@@ -182,6 +186,7 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
     interactive: value.interactive === true,
     editable: value.editable === true,
     disabled: value.disabled === true,
+    inViewport: value.inViewport === true,
     download: value.download === true,
     ...(typeof value.href === 'string' ? { href: compact(value.href, 500) } : {}),
   }))
@@ -265,6 +270,8 @@ export async function inspectSemanticHandle(
     const interactive = editable || ['a', 'button', 'select', 'summary'].includes(tag)
       || element.hasAttribute('tabindex') || role !== 'generic' && role !== 'heading'
     const href = safeHref()
+    const rect = element.getBoundingClientRect()
+    const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
     return {
       role,
       name: accessibleName(),
@@ -273,6 +280,7 @@ export async function inspectSemanticHandle(
       interactive,
       editable,
       disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true',
+      inViewport,
       download: element.hasAttribute('download'),
       ...(href === undefined ? {} : { href }),
     }

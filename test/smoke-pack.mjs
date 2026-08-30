@@ -73,9 +73,9 @@ try {
   const probe = [
     "import { BrowserManager, BROWSER_DRIVER_CONTRACT_VERSION, BROWSER_DRIVER_SERVICE } from '@zseven-w/dsh-browser';",
     "if (BROWSER_DRIVER_SERVICE !== 'zsevenBrowserDriver') throw new Error('service contract mismatch');",
-    "if (BROWSER_DRIVER_CONTRACT_VERSION !== 2) throw new Error('driver contract version mismatch');",
+    "if (BROWSER_DRIVER_CONTRACT_VERSION !== 3) throw new Error('driver contract version mismatch');",
     "const manager = new BrowserManager({ allowedOrigins: [] });",
-    "if (manager.kind !== 'browser' || manager.contractVersion !== 2) throw new Error('driver identity mismatch');",
+    "if (manager.kind !== 'browser' || manager.contractVersion !== 3) throw new Error('driver identity mismatch');",
     "try {",
     "  const started = await manager.start('packed-smoke');",
     "  if (started.isolation !== 'ephemeral-user-data') throw new Error('isolation mismatch');",
