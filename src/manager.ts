@@ -274,7 +274,6 @@ export class BrowserManager implements ZSevenBrowserDriver {
         headless,
         viewport: { width: 1280, height: 800 },
         acceptDownloads: false,
-        ...(options.storageState === undefined ? {} : { storageState: options.storageState }),
         args: [
           '--disable-background-networking',
           '--disable-component-update',
@@ -343,6 +342,34 @@ export class BrowserManager implements ZSevenBrowserDriver {
       })
       context.on('close', () => { this.#trackCleanup(this.#onContextClosed(session)) })
       this.#touch(session)
+
+      const storageState = options.storageState
+      if (storageState !== undefined) {
+        // launchPersistentContext has no storageState option (that parameter
+        // belongs to newContext), so the pre-filtered state is applied
+        // explicitly: cookies through the context, localStorage by visiting
+        // each origin once before the session's first real navigation. Every
+        // storage origin must clear the same origin allowlist as navigation.
+        if (storageState.cookies.length > 0) {
+          await this.#abortClosesSession(session, operationSignal, context.addCookies(storageState.cookies))
+        }
+        for (const entry of storageState.origins) {
+          const originUrl = normalizeNavigationUrl(entry.origin)
+          this.#assertAllowedUrl(originUrl)
+          await this.#abortClosesSession(
+            session,
+            operationSignal,
+            page
+              .goto(originUrl, { waitUntil: 'domcontentloaded', timeout: this.#actionTimeoutMs })
+              .then(() => page.evaluate((items) => {
+                for (const item of items) localStorage.setItem(item.name, item.value)
+              }, entry.localStorage)),
+          )
+        }
+        if (storageState.origins.length > 0 && initialUrl === 'about:blank') {
+          await this.#abortClosesSession(session, operationSignal, page.goto('about:blank', { timeout: this.#actionTimeoutMs }))
+        }
+      }
 
       if (initialUrl !== 'about:blank') {
         await this.#abortClosesSession(
