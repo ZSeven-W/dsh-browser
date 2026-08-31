@@ -1,16 +1,55 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 3 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 4 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
+
+/**
+ * One cookie in the Playwright storageState JSON format. The caller (dsh-qa)
+ * injects ALREADY-FILTERED state: this driver performs no origin filtering
+ * and applies the entries verbatim to a fresh ephemeral profile.
+ */
+export interface BrowserStorageCookie {
+  name: string
+  value: string
+  /** Exact host or dot-prefixed parent (`.example.com`). Never a wildcard. */
+  domain: string
+  path: string
+  /** Unix time in seconds. */
+  expires: number
+  httpOnly: boolean
+  secure: boolean
+  sameSite: 'Strict' | 'Lax' | 'None'
+}
+
+/**
+ * Playwright storageState JSON shape (cookies + per-origin localStorage).
+ * The driver accepts this verbatim; ownership of the origin/domain scoping
+ * decision (fail-closed filtering) belongs to the caller, not to the driver.
+ */
+export interface BrowserStorageState {
+  cookies: BrowserStorageCookie[]
+  origins: Array<{
+    origin: string
+    localStorage: Array<{ name: string; value: string }>
+  }>
+}
 
 export interface BrowserSessionStartOptions {
   /** Initial http(s) URL. Omit to start at about:blank. */
   url?: string
   /** Defaults to true. Headful mode is intended for local diagnosis only. */
   headless?: boolean
+  /**
+   * Owner-authorized, already-filtered login state to pre-load into the fresh
+   * ephemeral profile. The driver applies it at context creation and does NOT
+   * filter, validate, copy, or persist it; the profile is destroyed on stop as
+   * always. The caller must never pass state containing entries outside the
+   * explicitly authorized origins.
+   */
+  storageState?: BrowserStorageState
 }
 
 export interface BrowserSessionInfo {

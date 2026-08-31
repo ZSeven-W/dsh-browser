@@ -50,7 +50,7 @@ test('disposeScope aborts and drains its in-flight start without session resurre
   })
   try {
     assert.equal(manager.kind, 'browser')
-    assert.equal(manager.contractVersion, 3)
+    assert.equal(manager.contractVersion, 4)
     const starting = manager.start('scope-agent')
     const startOutcome = starting.then(
       () => ({ ok: true }),

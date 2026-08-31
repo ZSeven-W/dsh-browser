@@ -274,6 +274,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
         headless,
         viewport: { width: 1280, height: 800 },
         acceptDownloads: false,
+        ...(options.storageState === undefined ? {} : { storageState: options.storageState }),
         args: [
           '--disable-background-networking',
           '--disable-component-update',
