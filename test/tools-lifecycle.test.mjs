@@ -56,7 +56,7 @@ function fakeDriver(events = []) {
 }
 
 test('raw tools use full JSON Schema, renderer ContentBlocks, and agent-owned identity', async () => {
-  assert.equal(BROWSER_DRIVER_CONTRACT_VERSION, 4)
+  assert.equal(BROWSER_DRIVER_CONTRACT_VERSION, 5)
   const events = []
   const tools = browserToolList(createBrowserTools(fakeDriver(events)))
   assert.deepEqual(tools.map((tool) => tool.name), BROWSER_TOOL_NAMES)

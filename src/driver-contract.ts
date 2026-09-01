@@ -1,7 +1,7 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 4 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 5 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
@@ -93,6 +93,50 @@ export interface BrowserSemanticNode {
   inViewport: boolean
   /** Query strings and fragments are removed. */
   href?: string
+  /**
+   * Bounded observable value of a value-bearing control, so a consumer can
+   * prove an action against its own target instead of an unrelated node that
+   * happened to change: `<input>` (except checkbox/radio/button/submit/reset/
+   * image/file/hidden, whose `.value` is a checked-state, an interface label
+   * already carried by `name`, or a fake upload path), `<textarea>`,
+   * `<select>` (the selected option's `value`, which HTML defaults to the
+   * option's text when the option carries no `value` attribute; for a
+   * `multiple` select, the first selected option), and any element carrying
+   * `aria-valuetext`/`aria-valuenow`.
+   *
+   * An empty string is a real observation ("this field is empty"); the ABSENCE
+   * of the field means the element has no observable value at all, or that its
+   * value was withheld — see `valueWithheld`. Never present together with
+   * `valueWithheld`.
+   *
+   * Values are attacker-influenced strings and are bounded exactly like `name`:
+   * whitespace runs are collapsed to single spaces, the string is trimmed, and
+   * the result is clipped to 180 characters. A consumer comparing an intended
+   * fill text against `value` must apply the same normalization.
+   *
+   * Like `inViewport`, the value fields are deliberately NOT part of the
+   * identity fingerprint used to re-resolve a ref. A value change — typed,
+   * scripted, or arriving asynchronously — must not invalidate a ref the way
+   * navigation or a semantic change does.
+   */
+  value?: string
+  /**
+   * Present, and always `true`, when the element bears a value that this driver
+   * deliberately never reads: `<input type="password">`, an `autocomplete`
+   * token of `current-password`, `new-password`, `one-time-code`, `cc-number`,
+   * or `cc-csc`, or a value-bearing control inside an `aria-hidden="true"`
+   * subtree (the shape used by masked secure widgets). The secret never leaves
+   * the page. This explicit marker — rather than a silently missing field — is
+   * what lets a consumer tell "no value here" apart from "value deliberately
+   * not captured".
+   */
+  valueWithheld?: true
+  /**
+   * Present, and always `true`, when the observable value exceeded the
+   * 180-character bound and `value` holds only its prefix. An equality
+   * assertion against a truncated value is invalid.
+   */
+  valueTruncated?: true
 }
 
 export interface BrowserObservation {

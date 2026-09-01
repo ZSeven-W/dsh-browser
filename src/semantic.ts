@@ -21,6 +21,17 @@ export interface RawSemanticCandidate {
   inViewport: boolean
   download: boolean
   href?: string
+  /**
+   * Bounded, whitespace-compacted observable value of a value-bearing control.
+   * Absent when the element has no value, when the value was withheld, and on
+   * the bound-handle re-resolution path, which never reads values at all.
+   * Not part of the identity fingerprint.
+   */
+  value?: string
+  /** True when the element bears a secret value that was deliberately never read. Not part of the identity fingerprint. */
+  valueWithheld?: true
+  /** True when the observable value exceeded the bound and `value` holds only its prefix. Not part of the identity fingerprint. */
+  valueTruncated?: true
 }
 
 export interface StoredSemanticTarget extends RawSemanticCandidate {
@@ -30,6 +41,14 @@ export interface StoredSemanticTarget extends RawSemanticCandidate {
 
 const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' ').trim().slice(0, max)
 
+/**
+ * Identity fingerprint used to re-resolve a ref against the live DOM. It covers
+ * only properties that answer "which element is this": `inViewport` (a
+ * scroll-dependent fact) and the value fields (`value`, `valueWithheld`,
+ * `valueTruncated` — fill-, keystroke-, or script-dependent facts) are
+ * deliberately excluded, so a value change alone never invalidates a ref the
+ * way navigation or a semantic change does.
+ */
 export function semanticFingerprint(candidate: RawSemanticCandidate): string {
   const stable = {
     role: candidate.role,
@@ -70,6 +89,14 @@ export function publicSemanticNode(target: StoredSemanticTarget): BrowserSemanti
     disabled: target.disabled,
     inViewport: target.inViewport,
     ...(target.href === undefined ? {} : { href: target.href }),
+    ...(target.valueWithheld === true
+      ? { valueWithheld: true as const }
+      : target.value === undefined
+        ? {}
+        : {
+            value: target.value,
+            ...(target.valueTruncated === true ? { valueTruncated: true as const } : {}),
+          }),
   }
 }
 
@@ -151,6 +178,47 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
         return parsed.href.slice(0, 500)
       } catch { return undefined }
     }
+    const VALUE_MAX = 180
+    /**
+     * Input types whose `.value` is a credential, a fake upload path, an
+     * interface label already carried by `name`, or a checked-state rather than
+     * a value. Checkedness is intentionally not modelled as a value.
+     */
+    const valuelessInputTypes = ['checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'file', 'hidden']
+    /** Autocomplete tokens by which a page declares a field secret-bearing. */
+    const secretAutocomplete = ['current-password', 'new-password', 'one-time-code', 'cc-number', 'cc-csc']
+    const bearsSecret = (element: Element, inputType: string): boolean => {
+      if (inputType === 'password') return true
+      const declared = String(element.getAttribute('autocomplete') ?? '').toLowerCase()
+      if (declared.split(/[\s,]+/u).some((token) => secretAutocomplete.includes(token))) return true
+      // A value-bearing control hidden from assistive technology is the shape used
+      // by masked/secure widgets: fail closed and never read it.
+      return element.closest('[aria-hidden="true"]') !== null
+    }
+    /**
+     * Read the observable value of a value-bearing control. A secret-bearing
+     * control is never read at all: the secret does not cross this boundary,
+     * and the caller receives the explicit `valueWithheld` marker instead.
+     */
+    const observableValue = (element: Element, inputType: string): Record<string, unknown> => {
+      const nativeValue = element instanceof HTMLInputElement
+        ? (valuelessInputTypes.includes(inputType) ? null : element.value)
+        : element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement
+          ? element.value
+          : null
+      const ariaText = String(element.getAttribute('aria-valuetext') ?? '')
+      const ariaNow = String(element.getAttribute('aria-valuenow') ?? '')
+      const aria = ariaText.trim() === '' ? ariaNow : ariaText
+      if (nativeValue === null && aria.trim() === '') return {}
+      if (bearsSecret(element, inputType)) return { valueWithheld: true }
+      const raw = nativeValue === null ? aria : nativeValue
+      const bounded = raw.slice(0, VALUE_MAX * 4)
+      const collapsed = bounded.replace(/\s+/gu, ' ').trim()
+      return {
+        value: collapsed.slice(0, VALUE_MAX),
+        ...(collapsed.length > VALUE_MAX || raw.length > bounded.length ? { valueTruncated: true } : {}),
+      }
+    }
     const output: Array<Record<string, unknown>> = []
     for (const element of elements.slice(0, Number(limit))) {
       const html = element as HTMLElement
@@ -172,6 +240,7 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
         interactive, editable, disabled, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
+        ...observableValue(element, inputType),
       })
     }
     return output
@@ -189,6 +258,14 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
     inViewport: value.inViewport === true,
     download: value.download === true,
     ...(typeof value.href === 'string' ? { href: compact(value.href, 500) } : {}),
+    ...(value.valueWithheld === true
+      ? { valueWithheld: true as const }
+      : typeof value.value === 'string'
+        ? {
+            value: compact(value.value, 180),
+            ...(value.valueTruncated === true ? { valueTruncated: true as const } : {}),
+          }
+        : {}),
   }))
 }
 
@@ -196,6 +273,10 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
  * Re-read semantics from one already-bound backend node. Actions use this
  * exact ElementHandle through risk, hit-test, and dispatch so a selector can
  * never silently resolve to a replacement node between those stages.
+ *
+ * This path deliberately reads no value: values are excluded from the identity
+ * fingerprint, so re-resolution does not need them, and not reading them keeps
+ * the secret-exposure surface confined to the single collection path.
  */
 export async function inspectSemanticHandle(
   handle: ElementHandle<Element>,
