@@ -18,6 +18,7 @@ import type {
   BrowserSessionInfo,
   BrowserSessionStartOptions,
   BrowserSessionStopResult,
+  BrowserStorageCookie,
   BrowserVisualCapture,
   BrowserVisualMark,
   BrowserVisualObserveRequest,
@@ -147,6 +148,13 @@ function compact(value: string, max: number): string {
 function isDetachedElementError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return /(?:element|node).{0,40}(?:detached|not attached)|not connected to the document/iu.test(message)
+}
+
+function isIpLiteralHost(host: string): boolean {
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(host)) {
+    return host.split('.').every((part) => Number(part) >= 0 && Number(part) <= 255)
+  }
+  return host.includes(':')
 }
 
 export function publicPageUrl(value: string): string {
@@ -387,9 +395,13 @@ export class BrowserManager implements ZSevenBrowserDriver {
         // launchPersistentContext has no storageState option (that parameter
         // belongs to newContext), so the pre-filtered state is applied
         // explicitly: cookies through the context, localStorage by visiting
-        // each origin once before the session's first real navigation. Every
-        // storage origin must clear the same origin allowlist as navigation.
+        // each origin once before the session's first real navigation.
+        // localStorage origins must clear the exact-origin allowlist. Cookies
+        // are host-scoped by the browser: each cookie's host must map onto the
+        // host of an allowlisted origin, but once injected the cookie reaches
+        // every port and scheme on that host — the allowlist cannot narrow that.
         if (storageState.cookies.length > 0) {
+          for (const cookie of storageState.cookies) this.#assertCookieAllowed(cookie)
           await this.#abortClosesSession(session, operationSignal, context.addCookies(storageState.cookies))
         }
         for (const entry of storageState.origins) {
@@ -1273,6 +1285,56 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (value === '' || value === 'about:blank') return true
     if (this.#allowedOrigins === undefined) return true
     try { return this.#allowedOrigins.has(new URL(value).origin) } catch { return false }
+  }
+
+  /**
+   * Fail closed on any cookie whose host is not covered by an allowlisted
+   * origin. The browser delivers an injected cookie host-wide — to every port
+   * and scheme of its host, including subresource requests to non-allowlisted
+   * origins — so the exact-origin allowlist can never narrow cookie delivery.
+   * Leading-dot domains map onto the base host and its subdomains; IP literals
+   * must not be dot-prefixed; url-form cookies are checked by their url host.
+   * In unrestricted mode (no allowlist) no check applies, mirroring
+   * navigation.
+   */
+  #assertCookieAllowed(cookie: BrowserStorageCookie): void {
+    if (this.#allowedOrigins === undefined) return
+    let host: string | null = null
+    let dotPrefixed = false
+    if (typeof cookie.url === 'string' && cookie.url.trim() !== '') {
+      try {
+        host = new URL(cookie.url).hostname
+      } catch {
+        throw new DriverIssue('STORAGE_COOKIE_REJECTED', 'a cookie url must be an absolute http(s) URL', true)
+      }
+    } else {
+      const domain = cookie.domain
+      if (typeof domain !== 'string' || domain.trim() === '') {
+        throw new DriverIssue('STORAGE_COOKIE_REJECTED', 'every cookie must carry a domain or a url', true)
+      }
+      dotPrefixed = domain.startsWith('.')
+      host = dotPrefixed ? domain.slice(1) : domain
+      if (host === '' || host.includes('*') || /\s/u.test(host)) {
+        throw new DriverIssue('STORAGE_COOKIE_REJECTED', 'invalid cookie domain: ' + compact(domain, 120), true)
+      }
+      if (dotPrefixed && isIpLiteralHost(host)) {
+        throw new DriverIssue('STORAGE_COOKIE_REJECTED', 'leading-dot cookie domains cannot be IP literals: ' + compact(domain, 120), true)
+      }
+    }
+    if (host === null || host === '') {
+      throw new DriverIssue('STORAGE_COOKIE_REJECTED', 'cookie host could not be determined', true)
+    }
+    const covered = [...this.#allowedOrigins].some((origin) => {
+      const originHost = new URL(origin).hostname
+      return dotPrefixed ? originHost === host || originHost.endsWith('.' + host) : originHost === host
+    })
+    if (!covered) {
+      throw new DriverIssue(
+        'STORAGE_COOKIE_REJECTED',
+        'cookie host ' + host + ' is not covered by any allowed origin; cookies are host-scoped and cannot be narrowed to a single origin',
+        true,
+      )
+    }
   }
 
   #assertAllowedUrl(value: string): void {

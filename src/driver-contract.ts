@@ -7,14 +7,23 @@ export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
 
 /**
- * One cookie in the Playwright storageState JSON format. The caller (dsh-qa)
- * injects ALREADY-FILTERED state: this driver performs no origin filtering
- * and applies the entries verbatim to a fresh ephemeral profile.
+ * One cookie in the Playwright storageState JSON format.
+ *
+ * Cookies are HOST-SCOPED by the browser: once injected, the cookie is sent
+ * to every origin (scheme and port) on its host — including subresource
+ * requests to origins outside the operator allowlist. The exact-origin
+ * allowlist can never narrow cookie delivery. The driver therefore fails the
+ * session start closed unless the cookie's host maps onto the host of at
+ * least one allowlisted origin; callers must only inject cookies for
+ * operator-owned hosts.
  */
 export interface BrowserStorageCookie {
   name: string
   value: string
-  /** Exact host or dot-prefixed parent (`.example.com`). Never a wildcard. */
+  /**
+   * Exact host or dot-prefixed parent (`.example.com`). Never a wildcard.
+   * Dot-prefixed IP literals (`.127.0.0.1`) are invalid and rejected.
+   */
   domain: string
   path: string
   /** Unix time in seconds. */
@@ -22,12 +31,20 @@ export interface BrowserStorageCookie {
   httpOnly: boolean
   secure: boolean
   sameSite: 'Strict' | 'Lax' | 'None'
+  /**
+   * Alternative to `domain`: an absolute http(s) URL whose host the cookie
+   * belongs to (Playwright url-form cookie). Checked by its host like
+   * domain-form cookies.
+   */
+  url?: string
 }
 
 /**
  * Playwright storageState JSON shape (cookies + per-origin localStorage).
- * The driver accepts this verbatim; ownership of the origin/domain scoping
- * decision (fail-closed filtering) belongs to the caller, not to the driver.
+ * The driver validates the entries against the operator policy and fails the
+ * session start closed on a mismatch: every localStorage origin must be
+ * exactly allowlisted, and every cookie host must map onto the host of an
+ * allowlisted origin (see BrowserStorageCookie for the host-scoping rules).
  */
 export interface BrowserStorageState {
   cookies: BrowserStorageCookie[]
@@ -43,11 +60,13 @@ export interface BrowserSessionStartOptions {
   /** Defaults to true. Headful mode is intended for local diagnosis only. */
   headless?: boolean
   /**
-   * Owner-authorized, already-filtered login state to pre-load into the fresh
-   * ephemeral profile. The driver applies it at context creation and does NOT
-   * filter, validate, copy, or persist it; the profile is destroyed on stop as
-   * always. The caller must never pass state containing entries outside the
-   * explicitly authorized origins.
+   * Owner-authorized login state to pre-load into the fresh ephemeral
+   * profile. The driver validates it at start: localStorage origins must be
+   * exactly allowlisted and cookie hosts must map onto an allowlisted origin's
+   * host, otherwise the start fails closed. Cookies are host-scoped by the
+   * browser and reach every port/scheme of their host, so the allowlist can
+   * only check the host, never narrow the delivery. The profile is destroyed
+   * on stop as always.
    */
   storageState?: BrowserStorageState
 }

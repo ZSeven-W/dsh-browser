@@ -55,6 +55,8 @@ Example profile row:
 
 The allowlist is enforced before start/navigation, at Chromium's document-request interception layer for redirects, and after top-level page changes. An empty list allows only `about:blank`. It constrains top-level documents, not CDN/API subresources loaded by an allowed page.
 
+Injected `storageState` is validated the same way: every `localStorage` origin must be exactly allowlisted, and every cookie's host must map onto the host of an allowlisted origin (leading-dot domains and IP literals are checked). Cookies are host-scoped by the browser: once injected they are sent to **every port and scheme** of that host — including subresource requests to origins outside the allowlist — so the allowlist cannot narrow cookie delivery; inject cookies only for operator-owned hosts.
+
 ## Safety and evidence boundaries
 
 - Live target semantics—not a model-provided “sensitive” flag—reject destructive, financial, send/publish, security-change, password, upload, and download actions.

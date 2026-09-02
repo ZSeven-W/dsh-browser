@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BrowserManager, discoverInstalledBrowser } from '../lib/index.js'
@@ -67,6 +67,58 @@ test('storage state injects cookies and localStorage into the fresh ephemeral pr
   } finally {
     await manager.dispose().catch(() => {})
     server.close()
+  }
+})
+
+test('storage state cookies whose host is not covered by the allowlist fail the session start closed', { timeout: 120_000 }, async (t) => {
+  try { await discoverInstalledBrowser() } catch (error) {
+    t.skip('installed Chrome/Edge/Chromium unavailable: ' + error.message)
+    return
+  }
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end('<h1>Cookie fixture</h1>')
+  })
+  const port = await listen(server)
+  const origin = 'http://127.0.0.1:' + port
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-browser-storage-cookie-deny-'))
+  const manager = new BrowserManager({ rootDir, allowedOrigins: [origin], observationTtlMs: 60_000 })
+  const cookie = (overrides) => ({
+    name: 'session', value: 'cookie-secret', domain: '127.0.0.1', path: '/',
+    expires: Math.floor(Date.now() / 1000) + 3600,
+    httpOnly: false, secure: false, sameSite: 'Lax', ...overrides,
+  })
+  try {
+    // Unrelated host: the cookie can never be delivered to any allowlisted origin.
+    await assert.rejects(
+      manager.start('owner-a', { url: origin + '/', storageState: { cookies: [cookie({ domain: 'localhost' })], origins: [] } }),
+      /cookie|host|allow/iu,
+      'an unrelated-host cookie must fail the session start closed',
+    )
+    assert.equal(manager.activeOwners().length, 0, 'no session survives a rejected cookie start')
+    // Leading-dot IP literals are not valid cookie domains.
+    await assert.rejects(
+      manager.start('owner-b', { url: origin + '/', storageState: { cookies: [cookie({ domain: '.127.0.0.1' })], origins: [] } }),
+      /cookie|host|allow|domain/iu,
+      'a leading-dot IP-literal cookie domain must fail closed',
+    )
+    assert.equal(manager.activeOwners().length, 0)
+    // url-form cookie for a host outside the allowlist.
+    await assert.rejects(
+      manager.start('owner-c', { url: origin + '/', storageState: { cookies: [cookie({ url: 'http://localhost:9999/', domain: undefined })], origins: [] } }),
+      /cookie|host|allow/iu,
+      'a url-form cookie for an unrelated host must fail closed',
+    )
+    assert.equal(manager.activeOwners().length, 0)
+    // The allowlisted host itself is accepted (host-scoped delivery is documented).
+    const info = await manager.start('owner-d', { url: origin + '/', storageState: { cookies: [cookie()], origins: [] } })
+    assert.equal(info.state, 'running')
+    await manager.stop('owner-d')
+  } finally {
+    await manager.dispose().catch(() => {})
+    server.closeAllConnections?.()
+    await new Promise((resolve) => server.close(resolve))
+    await rm(rootDir, { recursive: true, force: true })
   }
 })
 

@@ -53,6 +53,8 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 
 白名单会在启动和显式导航前校验，在 Chromium Document Request 层拦截重定向，并在顶层页面变化后再次校验。空数组只允许 `about:blank`。该策略限制顶层文档，不限制白名单页面加载的 CDN / API 子资源。
 
+注入的 `storageState` 同样经过校验：每个 `localStorage` origin 必须精确匹配白名单；每个 Cookie 的 host 必须映射到某个白名单 origin 的 host（校验前导点域名与 IP 字面量）。Cookie 由浏览器按 host 作用域发送：一旦注入，会被发送到该 host 的 **所有端口与协议** —— 包括发往白名单之外 origin 的子资源请求 —— 因此白名单无法收窄 Cookie 的投递范围；只应注入 Operator 自有 host 的 Cookie。
+
 ## 安全与证据边界
 
 - 不相信模型传入的敏感标记，而是根据实时目标语义拒绝删除、付款、发送/发布、安全设置、密码、上传和下载动作。
