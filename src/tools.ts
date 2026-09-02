@@ -147,7 +147,8 @@ const stopSchema = closedObject({
   ownerId: { type: 'string' },
   stopped: { type: 'boolean' },
   reason: { type: 'string', enum: ['requested', 'not-running'] },
-})
+  forced: { type: 'boolean', const: true },
+}, ['ownerId', 'stopped', 'reason'])
 
 const outputFor = (schema: Record<string, unknown>) => ({ schema, render: renderJson })
 

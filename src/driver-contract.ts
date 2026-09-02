@@ -367,6 +367,12 @@ export interface BrowserSessionStopResult {
   ownerId: string
   stopped: boolean
   reason: 'requested' | 'not-running'
+  /**
+   * Present, and always true, when the context close exceeded its bound (an
+   * in-flight request the remote endpoint never answered) and the driver
+   * force-killed the browser process before deleting the profile directory.
+   */
+  forced?: true
 }
 
 export interface ZSevenBrowserDriver {

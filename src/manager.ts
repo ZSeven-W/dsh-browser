@@ -49,6 +49,16 @@ const DEFAULT_MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 const MAX_CAPTURE_SCALE = 3
 const MAX_MARKS = 200
 const DEFAULT_MARKS = 80
+/** Bound for context.close(): beyond this the browser process is force-killed. */
+const FORCED_CLOSE_TIMEOUT_MS = 5_000
+/** How long to wait for a force-killed browser process to leave the process table. */
+const FORCED_KILL_EXIT_POLL_MS = 4_000
+/**
+ * Bound for detaching the per-page origin-policy CDP sessions during close.
+ * A detach can hang indefinitely when a Fetch-intercepted navigation is in
+ * flight; the transport dies with the browser process, so skip it after this.
+ */
+const FORCED_CDP_DETACH_TIMEOUT_MS = 2_000
 
 type PersistentContextOptions = NonNullable<Parameters<typeof chromium.launchPersistentContext>[1]>
 type PersistentLauncher = (userDataDir: string, options: PersistentContextOptions) => Promise<BrowserContext>
@@ -95,6 +105,10 @@ interface ManagedSession {
   closed: boolean
   closing: boolean
   dirRemoval: Promise<void> | undefined
+  /** True when close exceeded its bound and the browser process was force-killed. */
+  forceClosed: boolean
+  /** Browser main-process pid captured at start, used for the bounded-close force kill. */
+  browserPid: number | undefined
   idleTimer?: NodeJS.Timeout
   tail: Promise<void>
   policyPages: WeakSet<Page>
@@ -107,6 +121,13 @@ class DriverIssue extends Error {
   constructor(readonly code: string, message: string, readonly rejected: boolean) {
     super(message)
     this.name = 'DriverIssue'
+  }
+}
+
+class ForcedCloseError extends Error {
+  constructor() {
+    super('browser context close exceeded the forced-close bound')
+    this.name = 'ForcedCloseError'
   }
 }
 
@@ -320,6 +341,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
         closed: false,
         closing: false,
         dirRemoval: undefined,
+        forceClosed: false,
+        browserPid: undefined,
         tail: Promise.resolve(),
         policyPages: new WeakSet(),
         policySessions: new Set(),
@@ -334,6 +357,21 @@ export class BrowserManager implements ZSevenBrowserDriver {
       this.#sessions.set(owner, session)
       await this.#installOriginPolicy(session)
       if (this.#disposed || operationSignal.aborted || session.closed) throw new DriverIssue('DRIVER_DISPOSED', 'browser driver was disposed during policy installation', true)
+      // Capture the browser main-process pid while the protocol is healthy so
+      // the bounded-close force kill never depends on a wedged connection.
+      try {
+        const infoSession = await context.newCDPSession(page)
+        try {
+          const info = await infoSession.send('SystemInfo.getProcessInfo') as {
+            processInfo?: Array<{ type?: string; id?: number }>
+          }
+          session.browserPid = info.processInfo?.find((entry) => entry.type === 'browser')?.id
+        } finally {
+          await infoSession.detach().catch(() => {})
+        }
+      } catch {
+        session.browserPid = undefined
+      }
       for (const openPage of context.pages()) {
         this.#attachPage(session, openPage)
         session.readyPages.add(openPage)
@@ -936,7 +974,12 @@ export class BrowserManager implements ZSevenBrowserDriver {
     const session = this.#sessions.get(owner)
     if (!session) return { ownerId: owner, stopped: false, reason: 'not-running' }
     await this.#closeSession(session)
-    return { ownerId: owner, stopped: true, reason: 'requested' }
+    return {
+      ownerId: owner,
+      stopped: true,
+      reason: 'requested',
+      ...(session.forceClosed ? { forced: true as const } : {}),
+    }
   }
 
   async disposeScope(ownerId: string): Promise<void> {
@@ -1292,12 +1335,49 @@ export class BrowserManager implements ZSevenBrowserDriver {
       session.observation = undefined
       session.readyPages.clear()
       session.secret.fill(0)
-      for (const cdp of session.policySessions) await cdp.detach().catch(() => {})
+      for (const cdp of session.policySessions) {
+        // detach() can hang on an in-flight Fetch-paused navigation; bound it.
+        await Promise.race([
+          cdp.detach().catch(() => {}),
+          delay(FORCED_CDP_DETACH_TIMEOUT_MS).then(() => {}),
+        ])
+      }
       session.policySessions.clear()
-      await session.context.close().catch(() => {})
+      await this.#closeContextBounded(session)
       session.closing = false
     }
     await this.#removeSessionDir(session)
+  }
+
+  /**
+   * Close the browser context within a hard bound. context.close() can wait
+   * unboundedly on an in-flight routed request (for example a navigation to an
+   * endpoint that never answers); when the bound expires the browser process is
+   * force-killed and the session is marked forceClosed, so dispose/stop always
+   * settle and the profile directory is still deleted.
+   */
+  async #closeContextBounded(session: ManagedSession): Promise<void> {
+    try {
+      await Promise.race([
+        session.context.close().catch(() => {}),
+        delay(FORCED_CLOSE_TIMEOUT_MS).then(() => { throw new ForcedCloseError() }),
+      ])
+    } catch (error) {
+      if (!(error instanceof ForcedCloseError)) throw error
+      session.forceClosed = true
+      await this.#forceKillBrowser(session)
+    }
+  }
+
+  async #forceKillBrowser(session: ManagedSession): Promise<void> {
+    const pid = session.browserPid
+    if (pid === undefined) return
+    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    const deadline = Date.now() + FORCED_KILL_EXIT_POLL_MS
+    while (Date.now() < deadline) {
+      try { process.kill(pid, 0) } catch { break }
+      await delay(100)
+    }
   }
 
   async #removeSessionDir(session: ManagedSession): Promise<void> {
