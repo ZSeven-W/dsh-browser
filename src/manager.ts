@@ -174,7 +174,10 @@ export function publicPageUrl(value: string): string {
 export function redactEvidenceText(value: string): string {
   return compact(value, 800)
     .replace(/\b(?:bearer|basic)\s+[A-Za-z0-9._~+\/-]+=*/giu, '[REDACTED_AUTH]')
-    .replace(/(authorization|proxy-authorization)\s*[:=]\s*[^\s,;]+/giu, '$1: [REDACTED]')
+    // The optional quotes cover JSON-shaped credentials
+    // ({"authorization":"…"}) without weakening the plain
+    // Authorization=Bearer / authorization: token forms.
+    .replace(/((?:authorization|proxy-authorization)\s*"?\s*[:=]\s*"?)[^\s,;"']+/giu, '$1[REDACTED]')
     .replace(/([?&](?:token|access_token|api_key|key|secret|code)=)[^&\s]+/giu, '$1[REDACTED]')
 }
 
