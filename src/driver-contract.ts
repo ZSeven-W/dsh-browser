@@ -1,7 +1,7 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 5 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 6 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
@@ -150,7 +150,18 @@ export interface BrowserObservation {
     viewport: { width: number; height: number }
   }
   nodes: BrowserSemanticNode[]
+  /**
+   * True whenever a selector-matching element that would have been emitted was
+   * not: matches beyond the 500-match scan window, nodes cut by the node/byte
+   * budgets, and iframe content (see truncationReasons).
+   */
   truncated: boolean
+  /**
+   * Present when truncated is true; names every reason the view is partial.
+   * Reasons: scan-window-exceeded, node-budget-exceeded,
+   * byte-budget-exceeded, iframe-not-traversed.
+   */
+  truncationReasons?: string[]
   limits: {
     maxNodes: number
     maxBytes: number

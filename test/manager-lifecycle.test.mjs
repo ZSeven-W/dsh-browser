@@ -4,7 +4,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { BrowserManager } from '../lib/index.js'
+import { BROWSER_DRIVER_CONTRACT_VERSION, BrowserManager } from '../lib/index.js'
 
 test('dispose aborts and drains a late browser launch before returning', { timeout: 10_000 }, async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'dsh-browser-late-start-'))
@@ -50,7 +50,7 @@ test('disposeScope aborts and drains its in-flight start without session resurre
   })
   try {
     assert.equal(manager.kind, 'browser')
-    assert.equal(manager.contractVersion, 5)
+    assert.equal(manager.contractVersion, BROWSER_DRIVER_CONTRACT_VERSION)
     const starting = manager.start('scope-agent')
     const startOutcome = starting.then(
       () => ({ ok: true }),

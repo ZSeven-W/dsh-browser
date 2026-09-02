@@ -100,8 +100,16 @@ export function publicSemanticNode(target: StoredSemanticTarget): BrowserSemanti
   }
 }
 
+export interface SemanticScanResult {
+  candidates: RawSemanticCandidate[]
+  /** Total selector matches in the main frame, before any filtering or budget. */
+  totalMatches: number
+  /** Number of matches the scan window actually examined (min(total, scanLimit)). */
+  scanned: number
+}
+
 /** Bounded DOM semantic projection. It never returns selectors or element ids. */
-export async function collectSemanticCandidates(page: Page, scanLimit = 500): Promise<RawSemanticCandidate[]> {
+export async function collectSemanticCandidates(page: Page, scanLimit = 500): Promise<SemanticScanResult> {
   const raw = await page.locator(SEMANTIC_SELECTOR).evaluateAll((elements, limit) => {
     const normalize = (value: string | null | undefined, max = 180): string => String(value ?? '')
       .replace(/\s+/gu, ' ')
@@ -220,6 +228,7 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       }
     }
     const output: Array<Record<string, unknown>> = []
+    const scanned = Math.min(elements.length, Number(limit))
     for (const element of elements.slice(0, Number(limit))) {
       const html = element as HTMLElement
       const style = getComputedStyle(element)
@@ -243,10 +252,11 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
         ...observableValue(element, inputType),
       })
     }
-    return output
+    return { output, totalMatches: elements.length, scanned }
   }, scanLimit)
 
-  return raw.map((value) => ({
+  return {
+    candidates: raw.output.map((value) => ({
     selector: String(value.selector),
     role: compact(String(value.role || 'generic'), 60),
     name: compact(String(value.name || ''), 180),
@@ -266,7 +276,10 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
             ...(value.valueTruncated === true ? { valueTruncated: true as const } : {}),
           }
         : {}),
-  }))
+    })),
+    totalMatches: raw.totalMatches,
+    scanned: raw.scanned,
+  }
 }
 
 /**

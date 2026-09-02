@@ -413,14 +413,20 @@ export class BrowserManager implements ZSevenBrowserDriver {
     const owner = validateOwner(ownerId)
     return this.#exclusive(owner, signal, async (session) => {
       const maxNodes = clampInt(options.maxNodes, 60, 1, 100)
-      const raw = await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))
+      const scan = await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))
+      const raw = scan.candidates
       const epoch = session.epoch + 1
       session.epoch = epoch
       const expiresAtMs = this.#now() + this.#observationTtlMs
       const targets: StoredSemanticTarget[] = []
       let bytes = 2
+      let nodeBudgetExceeded = false
+      let byteBudgetExceeded = false
       for (const [index, candidate] of raw.entries()) {
-        if (targets.length >= maxNodes) break
+        if (targets.length >= maxNodes) {
+          nodeBudgetExceeded = raw.length > targets.length
+          break
+        }
         const fingerprint = semanticFingerprint(candidate)
         const target: StoredSemanticTarget = {
           ...candidate,
@@ -429,7 +435,10 @@ export class BrowserManager implements ZSevenBrowserDriver {
         }
         const publicNode = publicSemanticNode(target)
         const nodeBytes = Buffer.byteLength(JSON.stringify(publicNode), 'utf8') + 1
-        if (bytes + nodeBytes > MAX_OBSERVATION_BYTES) break
+        if (bytes + nodeBytes > MAX_OBSERVATION_BYTES) {
+          byteBudgetExceeded = true
+          break
+        }
         bytes += nodeBytes
         targets.push(target)
       }
@@ -444,6 +453,10 @@ export class BrowserManager implements ZSevenBrowserDriver {
         targets: new Map(targets.map((target) => [target.ref, target])),
       }
       const viewport = session.page.viewportSize() ?? { width: 0, height: 0 }
+      const truncationReasons: string[] = []
+      if (scan.scanned < scan.totalMatches) truncationReasons.push('scan-window-exceeded')
+      if (nodeBudgetExceeded) truncationReasons.push('node-budget-exceeded')
+      if (byteBudgetExceeded) truncationReasons.push('byte-budget-exceeded')
       this.#touch(session)
       return {
         ownerId: owner,
@@ -456,7 +469,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
           viewport: { width: viewport.width, height: viewport.height },
         },
         nodes: targets.map(publicSemanticNode),
-        truncated: raw.length > targets.length || raw.length >= 500,
+        truncated: truncationReasons.length > 0,
+        ...(truncationReasons.length > 0 ? { truncationReasons } : {}),
         limits: { maxNodes, maxBytes: MAX_OBSERVATION_BYTES },
       }
     })
@@ -947,7 +961,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (session.page.url() !== observation.rawUrl) throw new DriverIssue('PAGE_CHANGED', 'the page URL changed after observation; observe again', failureRejected)
     const stored = observation.targets.get(ref)
     if (!stored) throw new DriverIssue('REF_UNKNOWN', 'the ref is not part of the latest observation', failureRejected)
-    const candidates = await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))
+    const candidates = (await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))).candidates
     const withFingerprints = candidates.map((candidate) => ({ candidate, fingerprint: semanticFingerprint(candidate) }))
     const sameSelector = withFingerprints.find((entry) => entry.candidate.selector === stored.selector)
     let live: RawSemanticCandidate | undefined

@@ -95,8 +95,9 @@ const observationSchema = closedObject({
   }),
   nodes: { type: 'array', items: semanticNodeSchema },
   truncated: { type: 'boolean' },
+  truncationReasons: { type: 'array', items: { type: 'string' } },
   limits: closedObject({ maxNodes: { type: 'integer' }, maxBytes: { type: 'integer' } }),
-})
+}, ['ownerId', 'epoch', 'fingerprint', 'expiresAt', 'page', 'nodes', 'truncated', 'limits'])
 const actionReceiptSchema = closedObject({
   receiptId: { type: 'string' },
   ownerId: { type: 'string' },
