@@ -518,6 +518,11 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (nodeBudgetExceeded) truncationReasons.push('node-budget-exceeded')
       if (byteBudgetExceeded) truncationReasons.push('byte-budget-exceeded')
       if (bindingDropped > 0) truncationReasons.push('identity-binding-failed')
+      // The projection is main-frame only: any iframe (same-origin included)
+      // makes the view partial, and the reason is named so evidence can never
+      // read 'absent' for content the driver did not look at.
+      const iframeCount = await session.page.locator('iframe, frame').count()
+      if (iframeCount > 0) truncationReasons.push('iframe-not-traversed')
       this.#touch(session)
       return {
         ownerId: owner,
@@ -1058,13 +1063,15 @@ export class BrowserManager implements ZSevenBrowserDriver {
     return { target: bound, handle }
   }
 
+
   /**
    * Capture a Playwright element handle for each emitted target, zipped by the
-   * match index recorded during collection, and verify in-page that every
-   * handle still denotes the node at that index. Unused handles are disposed;
-   * targets whose binding cannot be verified keep no handle (the caller drops
-   * them and flags the observation). Fail closed: if capture throws, no target
-   * keeps a handle.
+   * match index recorded during collection, then verify — through the same
+   * piercing locator engine that collected the candidates, so open shadow
+   * roots index identically — that every handle still denotes the node at its
+   * index. Unused handles are disposed; targets whose binding cannot be
+   * verified keep no handle (the caller drops them and flags the observation).
+   * Fail closed: if capture throws, no target keeps a handle.
    */
   async #bindTargetHandles(session: ManagedSession, targets: StoredSemanticTarget[]): Promise<number> {
     if (targets.length === 0) return 0
@@ -1076,12 +1083,15 @@ export class BrowserManager implements ZSevenBrowserDriver {
       for (const handle of allHandles) {
         if (!used.has(handle)) void handle.dispose().catch(() => {})
       }
-      const verified = await session.page.evaluate(
-        ([handles, list, selector]) => {
-          const all = document.querySelectorAll(selector)
-          return list.map((index, k) => handles[k] != null && index !== undefined && (all[index] as Element) === (handles[k] as unknown as Element))
+      // Verify against the live piercing match list. A plain
+      // document.querySelectorAll would order shadow-DOM nodes differently and
+      // could never see them, silently dropping every shadow target.
+      const verified = await session.page.locator(SEMANTIC_SELECTOR).evaluateAll(
+        (elements, args) => {
+          const [anchors, list] = args
+          return list.map((index, k) => anchors[k] != null && index !== undefined && (elements[index] as unknown as Element) === (anchors[k] as unknown as Element))
         },
-        [picked, indexes, SEMANTIC_SELECTOR] as const,
+        [picked, indexes] as const,
       )
       let dropped = 0
       for (let k = 0; k < targets.length; k += 1) {

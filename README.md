@@ -100,7 +100,7 @@ The local integration gate starts installed Chrome headlessly, runs two isolated
 Initial limitations are intentional and should not be read as claims:
 
 - Chromium-family browsers only; Firefox and WebKit are not implemented.
-- Main-document semantic DOM projection; cross-origin iframe and closed-shadow-root interaction are not implemented.
+- Main-document semantic DOM projection. Any `<iframe>`/`<frame>` content — same-origin included — is out of scope for now: the observation sets `truncated` with reason `iframe-not-traversed`. Closed-shadow-root interaction is not implemented.
 - `visualObserve` performs capture only (pixels + Set-of-Mark labels); visual understanding is delegated to the DSH harness vision model.
 - No existing-profile, cookie, extension, or signed-in-tab borrowing.
 - Headless mode is the accepted path; the available headful option has not received the same integration coverage.

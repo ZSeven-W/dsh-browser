@@ -98,7 +98,7 @@ import {
 当前明确限制：
 
 - 仅支持 Chromium 系浏览器，未实现 Firefox / WebKit。
-- 当前是主文档语义 DOM 投影，未实现跨域 iframe 和 closed shadow root 交互。
+- 当前是主文档语义 DOM 投影。所有 `<iframe>` / `<frame>` 内容（包括同源）暂不在范围内：观察会设置 `truncated` 并给出原因 `iframe-not-traversed`。未实现 closed shadow root 交互。
 - `visualObserve` 只做捕获（像素 + Set-of-Mark 标签）；视觉理解由 DSH Harness 的视觉模型完成。
 - 不读取现有 Profile、Cookie、扩展或已登录 Tab。
 - 已验收路径是 Headless；Headful 参数存在，但尚未获得同等集成覆盖。

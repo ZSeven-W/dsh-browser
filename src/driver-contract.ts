@@ -184,7 +184,9 @@ export interface BrowserObservation {
   /**
    * Present when truncated is true; names every reason the view is partial.
    * Reasons: scan-window-exceeded, node-budget-exceeded,
-   * byte-budget-exceeded, iframe-not-traversed.
+   * byte-budget-exceeded, identity-binding-failed, iframe-not-traversed
+   * (the projection is main-frame only; any iframe/frame element, same-origin
+   * included, sets truncated).
    */
   truncationReasons?: string[]
   limits: {
