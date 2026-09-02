@@ -33,10 +33,11 @@ import {
   opaqueRef,
   publicSemanticNode,
   semanticFingerprint,
+  SEMANTIC_SELECTOR,
   type RawSemanticCandidate,
   type StoredSemanticTarget,
 } from './semantic.js'
-import { analyzePng, measureSemanticBoxes } from './visual.js'
+import { analyzePng, measureSemanticBoxesByHandles } from './visual.js'
 
 const DEFAULT_OBSERVATION_TTL_MS = 30_000
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000
@@ -444,7 +445,15 @@ export class BrowserManager implements ZSevenBrowserDriver {
       }
       const rawUrl = session.page.url()
       const title = compact(await session.page.title().catch(() => ''), 300)
+      // Bind each emitted target to the Playwright element handle of the exact
+      // node it denotes. A ref must resolve to the ORIGINAL node identity, never
+      // to a selector re-match, so an identical twin sliding into the stored
+      // selector path cannot be substituted. A target whose binding cannot be
+      // verified is dropped and the observation is flagged truncated.
+      const bindingDropped = await this.#bindTargetHandles(session, targets)
+      if (bindingDropped > 0) targets.splice(0, targets.length, ...targets.filter((target) => target.handle !== undefined))
       const fingerprint = observationFingerprint(rawUrl, title, targets)
+      const previous = session.observation
       session.observation = {
         epoch,
         fingerprint,
@@ -452,11 +461,13 @@ export class BrowserManager implements ZSevenBrowserDriver {
         expiresAtMs,
         targets: new Map(targets.map((target) => [target.ref, target])),
       }
+      if (previous) void this.#disposeObservationHandles(previous)
       const viewport = session.page.viewportSize() ?? { width: 0, height: 0 }
       const truncationReasons: string[] = []
       if (scan.scanned < scan.totalMatches) truncationReasons.push('scan-window-exceeded')
       if (nodeBudgetExceeded) truncationReasons.push('node-budget-exceeded')
       if (byteBudgetExceeded) truncationReasons.push('byte-budget-exceeded')
+      if (bindingDropped > 0) truncationReasons.push('identity-binding-failed')
       this.#touch(session)
       return {
         ownerId: owner,
@@ -494,7 +505,17 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (fullPage) {
         await this.#abortClosesSession(session, signal, session.page.evaluate(() => { window.scrollTo(0, 0) }))
       }
-      const measured = await this.#abortClosesSession(session, signal, measureSemanticBoxes(session.page, targets.map((target) => target.selector)))
+      const measured = await this.#abortClosesSession(
+        session,
+        signal,
+        measureSemanticBoxesByHandles(session.page, targets.map((target) => target.handle ?? null)),
+      ).catch((error: unknown) => {
+        if (error instanceof DriverIssue) throw error
+        // Same-URL reloads and replaced documents destroy the execution
+        // context the retained handles live in; the observed DOM no longer
+        // exists, so the capture cannot be honest.
+        throw new DriverIssue('OBSERVATION_STALE', 'the observed document was replaced or destroyed; observe again', true)
+      })
       const viewport = session.page.viewportSize() ?? { width: 0, height: 0 }
       const captureWidth = fullPage ? measured.docWidth : viewport.width
       const captureHeight = fullPage ? measured.docHeight : viewport.height
@@ -682,7 +703,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
           // A scroll that cannot resolve its ref is a capability failure, not
           // a policy refusal: the browser genuinely could not scroll to it.
           const resolved = await this.#resolveTarget(active, action.ref, signal, action.kind !== 'scroll')
-          try {
+          {
             targetResult = { ref: action.ref, role: resolved.target.role, name: resolved.target.name }
             const observed = active.observation
             if (observed) observationResult = { epoch: observed.epoch, fingerprint: observed.fingerprint }
@@ -825,8 +846,6 @@ export class BrowserManager implements ZSevenBrowserDriver {
             await delay(100)
             if (active.closed) throw new DriverIssue('SESSION_CLOSED_AFTER_ACTION', 'the session closed fail-closed during action navigation', true)
             this.#assertAllowedUrl(active.page.url())
-          } finally {
-            await resolved.handle.dispose().catch(() => {})
           }
         }
       } catch (error) {
@@ -850,7 +869,11 @@ export class BrowserManager implements ZSevenBrowserDriver {
           reason = compact(error instanceof Error ? error.message : String(error), 500)
         }
       } finally {
-        if (dispatched) active.observation = undefined
+        if (dispatched) {
+          const previous = active.observation
+          active.observation = undefined
+          void this.#disposeObservationHandles(previous)
+        }
         pageAfter = await pageSummary(active.page)
         if (!active.closed) this.#touch(active)
       }
@@ -961,30 +984,70 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (session.page.url() !== observation.rawUrl) throw new DriverIssue('PAGE_CHANGED', 'the page URL changed after observation; observe again', failureRejected)
     const stored = observation.targets.get(ref)
     if (!stored) throw new DriverIssue('REF_UNKNOWN', 'the ref is not part of the latest observation', failureRejected)
-    const candidates = (await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))).candidates
-    const withFingerprints = candidates.map((candidate) => ({ candidate, fingerprint: semanticFingerprint(candidate) }))
-    const sameSelector = withFingerprints.find((entry) => entry.candidate.selector === stored.selector)
-    let live: RawSemanticCandidate | undefined
-    if (sameSelector?.fingerprint === stored.fingerprint) {
-      live = sameSelector.candidate
-    } else {
-      const matches = withFingerprints.filter((entry) => entry.fingerprint === stored.fingerprint)
-      if (matches.length > 1) throw new DriverIssue('TARGET_AMBIGUOUS', 'multiple live elements now match the observed target; observe again', failureRejected)
-      live = matches[0]?.candidate
+    // A ref binds to the ORIGINAL node identity: the element handle captured at
+    // observation time. There is deliberately no selector re-resolution here —
+    // an identical twin occupying the stored selector path must never be
+    // substituted for the observed node.
+    const handle = stored.handle
+    if (!handle) {
+      throw new DriverIssue('TARGET_CHANGED', 'the observation retained no live binding for this ref; observe again', failureRejected)
     }
-    if (!live) throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected)
-    const handle = await this.#abortClosesSession(
-      session,
-      signal,
-      session.page.locator(live.selector).first().elementHandle(),
-    )
-    if (!handle) throw new DriverIssue('TARGET_DETACHED', 'the live element detached before it could be bound', failureRejected)
-    const bound = await inspectSemanticHandle(handle, live.selector).catch(() => null)
+    const connected = await this.#abortClosesSession(session, signal, handle.evaluate((element) => element.isConnected)).catch(() => false)
+    if (!connected) {
+      throw new DriverIssue('TARGET_CHANGED', 'the element the ref denotes was removed from the page; observe again', failureRejected)
+    }
+    const bound = await inspectSemanticHandle(handle, stored.selector).catch(() => null)
     if (!bound || semanticFingerprint(bound) !== stored.fingerprint) {
-      await handle.dispose().catch(() => {})
-      throw new DriverIssue('TARGET_CHANGED', 'the bound backend node no longer matches the observed semantic fingerprint', failureRejected)
+      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected)
     }
     return { target: bound, handle }
+  }
+
+  /**
+   * Capture a Playwright element handle for each emitted target, zipped by the
+   * match index recorded during collection, and verify in-page that every
+   * handle still denotes the node at that index. Unused handles are disposed;
+   * targets whose binding cannot be verified keep no handle (the caller drops
+   * them and flags the observation). Fail closed: if capture throws, no target
+   * keeps a handle.
+   */
+  async #bindTargetHandles(session: ManagedSession, targets: StoredSemanticTarget[]): Promise<number> {
+    if (targets.length === 0) return 0
+    const indexes = targets.map((target) => target.matchIndex)
+    const allHandles: Array<ElementHandle<SVGElement | HTMLElement>> = await session.page.$$(SEMANTIC_SELECTOR)
+    try {
+      const picked: Array<ElementHandle<SVGElement | HTMLElement> | null> = indexes.map((index) => index === undefined ? null : allHandles[index] ?? null)
+      const used = new Set(picked.filter((handle): handle is ElementHandle<SVGElement | HTMLElement> => handle !== null))
+      for (const handle of allHandles) {
+        if (!used.has(handle)) void handle.dispose().catch(() => {})
+      }
+      const verified = await session.page.evaluate(
+        ([handles, list, selector]) => {
+          const all = document.querySelectorAll(selector)
+          return list.map((index, k) => handles[k] != null && index !== undefined && (all[index] as Element) === (handles[k] as unknown as Element))
+        },
+        [picked, indexes, SEMANTIC_SELECTOR] as const,
+      )
+      let dropped = 0
+      for (let k = 0; k < targets.length; k += 1) {
+        const handle = picked[k]
+        if (verified[k] === true && handle !== null && handle !== undefined) {
+          targets[k]!.handle = handle
+        } else {
+          dropped += 1
+          void handle?.dispose().catch(() => {})
+        }
+      }
+      return dropped
+    } catch {
+      for (const handle of allHandles) void handle.dispose().catch(() => {})
+      return targets.length
+    }
+  }
+
+  async #disposeObservationHandles(observation: ObservationRecord | undefined): Promise<void> {
+    if (!observation) return
+    await Promise.allSettled([...observation.targets.values()].map((target) => target.handle?.dispose().catch(() => {})))
   }
 
   async #hitTest(handle: ElementHandle<Element>): Promise<void> {
@@ -1225,6 +1288,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
       session.closed = true
       if (session.idleTimer) clearTimeout(session.idleTimer)
       if (this.#sessions.get(session.ownerId) === session) this.#sessions.delete(session.ownerId)
+      void this.#disposeObservationHandles(session.observation)
       session.observation = undefined
       session.readyPages.clear()
       session.secret.fill(0)

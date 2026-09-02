@@ -77,7 +77,13 @@ export interface BrowserObservationOptions {
 }
 
 export interface BrowserSemanticNode {
-  /** Opaque, short-lived handle. Never a selector or backend node id. */
+  /**
+   * Opaque, short-lived handle. Never a selector or backend node id. A ref is
+   * bound to the ORIGINAL DOM node observed: if that node is removed and an
+   * identical twin takes its place, acting on the ref rejects (TARGET_CHANGED)
+   * instead of silently re-resolving to the twin; Set-of-Mark boxes are
+   * measured on the same original node.
+   */
   ref: string
   role: string
   name: string

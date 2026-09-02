@@ -1,5 +1,5 @@
 import { inflateSync } from 'node:zlib'
-import type { Page } from 'playwright-core'
+import type { ElementHandle, Page } from 'playwright-core'
 import type { BrowserVisualQuality, BrowserVisualQualityClassification } from './driver-contract.js'
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
@@ -269,5 +269,62 @@ export async function measureSemanticBoxes(page: Page, selectors: string[]): Pro
     })
     return { docWidth, docHeight, viewportWidth: vw, viewportHeight: vh, rows }
   }, selectors)
+}
+
+/**
+ * Measure the live boxes of the exact DOM nodes the retained observation
+ * handles denote. Unlike selector-based measurement, a twin element that slid
+ * into the stored selector path can never be measured and labeled in place of
+ * the original: each row is the original node (or reports it detached), so a
+ * Set-of-Mark label is never drawn on a different element than its ref denotes.
+ */
+export async function measureSemanticBoxesByHandles(page: Page, targets: Array<ElementHandle<Element> | null>): Promise<BoxMeasurement> {
+  return page.evaluate((values) => {
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const docWidth = Math.max(document.documentElement.scrollWidth, vw)
+    const docHeight = Math.max(document.documentElement.scrollHeight, vh)
+    const scrollX = window.scrollX
+    const scrollY = window.scrollY
+    const empty = { x: 0, y: 0, width: 0, height: 0 }
+    const rows = values.map((el) => {
+      if (!el) {
+        return {
+          found: false, connected: false, hidden: false, zeroSize: false,
+          inViewport: false, inDocument: false, occluded: false,
+          box: empty, viewportBox: empty,
+        }
+      }
+      const connected = el.isConnected
+      if (!connected) {
+        return {
+          found: true, connected: false, hidden: false, zeroSize: false,
+          inViewport: false, inDocument: false, occluded: false,
+          box: empty, viewportBox: empty,
+        }
+      }
+      const style = getComputedStyle(el)
+      const hidden = style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0
+      const rect = el.getBoundingClientRect()
+      const zeroSize = rect.width <= 0 || rect.height <= 0
+      const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < vw && rect.top < vh
+      const boxX = rect.left + scrollX
+      const boxY = rect.top + scrollY
+      const inDocument = boxX + rect.width > 0 && boxY + rect.height > 0 && boxX < docWidth && boxY < docHeight
+      let occluded = false
+      if (!zeroSize && !hidden) {
+        const cx = Math.min(Math.max(rect.left + rect.width / 2, 0), vw - 1)
+        const cy = Math.min(Math.max(rect.top + rect.height / 2, 0), vh - 1)
+        const top = document.elementFromPoint(cx, cy)
+        occluded = top === null || (top !== el && !el.contains(top) && !top.contains(el))
+      }
+      return {
+        found: true, connected, hidden, zeroSize, inViewport, inDocument, occluded,
+        box: { x: boxX, y: boxY, width: rect.width, height: rect.height },
+        viewportBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+      }
+    })
+    return { docWidth, docHeight, viewportWidth: vw, viewportHeight: vh, rows }
+  }, targets)
 }
 

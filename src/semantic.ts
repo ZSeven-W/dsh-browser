@@ -10,6 +10,13 @@ export const SEMANTIC_SELECTOR = [
 
 export interface RawSemanticCandidate {
   selector: string
+  /**
+   * Position of this match in the full main-frame selector result list, used to
+   * zip candidates with the ElementHandles captured at collection time. Not
+   * part of the identity fingerprint and never serialized to consumers. Absent
+   * on the handle re-inspection path, which never re-binds by index.
+   */
+  matchIndex?: number
   role: string
   name: string
   tag: string
@@ -37,6 +44,12 @@ export interface RawSemanticCandidate {
 export interface StoredSemanticTarget extends RawSemanticCandidate {
   ref: string
   fingerprint: string
+  /**
+   * The Playwright element handle captured at observation time. A ref resolves
+   * to THIS node and never to a selector re-match, so an identical twin sliding
+   * into the stored selector path can never be substituted for the original.
+   */
+  handle?: ElementHandle<Element>
 }
 
 const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' ').trim().slice(0, max)
@@ -229,7 +242,8 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
     }
     const output: Array<Record<string, unknown>> = []
     const scanned = Math.min(elements.length, Number(limit))
-    for (const element of elements.slice(0, Number(limit))) {
+    for (let matchIndex = 0; matchIndex < scanned; matchIndex += 1) {
+      const element = elements[matchIndex] as Element
       const html = element as HTMLElement
       const style = getComputedStyle(element)
       const rect = element.getBoundingClientRect()
@@ -245,7 +259,7 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
       const href = safeHref(element)
       output.push({
-        selector: selectorFor(element), role, name: accessibleName(element), tag, inputType,
+        selector: selectorFor(element), matchIndex, role, name: accessibleName(element), tag, inputType,
         interactive, editable, disabled, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
@@ -258,6 +272,7 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
   return {
     candidates: raw.output.map((value) => ({
     selector: String(value.selector),
+    matchIndex: Number(value.matchIndex),
     role: compact(String(value.role || 'generic'), 60),
     name: compact(String(value.name || ''), 180),
     tag: compact(String(value.tag || ''), 30),
