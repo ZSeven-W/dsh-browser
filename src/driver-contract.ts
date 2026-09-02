@@ -150,8 +150,10 @@ export interface BrowserSemanticNode {
    * Present, and always `true`, when the element bears a value that this driver
    * deliberately never reads: `<input type="password">`, an `autocomplete`
    * token of `current-password`, `new-password`, `one-time-code`, `cc-number`,
-   * or `cc-csc`, or a value-bearing control inside an `aria-hidden="true"`
-   * subtree (the shape used by masked secure widgets). The secret never leaves
+   * or `cc-csc`, a value-bearing control inside an `aria-hidden="true"`
+   * subtree (the shape used by masked secure widgets), or a control whose
+   * computed `-webkit-text-security` is `disc`, `circle`, or `square` (CSS
+   * text masking renders bullets to the user). The secret never leaves
    * the page. This explicit marker — rather than a silently missing field — is
    * what lets a consumer tell "no value here" apart from "value deliberately
    * not captured".

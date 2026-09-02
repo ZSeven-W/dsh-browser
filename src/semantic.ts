@@ -214,7 +214,12 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       if (declared.split(/[\s,]+/u).some((token) => secretAutocomplete.includes(token))) return true
       // A value-bearing control hidden from assistive technology is the shape used
       // by masked/secure widgets: fail closed and never read it.
-      return element.closest('[aria-hidden="true"]') !== null
+      if (element.closest('[aria-hidden="true"]') !== null) return true
+      // CSS text masking (-webkit-text-security: disc|circle|square) renders
+      // bullets to the user, so the value is a secret and must never be read.
+      const style = getComputedStyle(element) as CSSStyleDeclaration & { webkitTextSecurity?: string; textSecurity?: string }
+      const masking = String(style.webkitTextSecurity ?? style.textSecurity ?? '')
+      return masking === 'disc' || masking === 'circle' || masking === 'square'
     }
     /**
      * Read the observable value of a value-bearing control. A secret-bearing
