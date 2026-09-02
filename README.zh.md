@@ -100,7 +100,7 @@ import {
 - 仅支持 Chromium 系浏览器，未实现 Firefox / WebKit。
 - 当前是主文档语义 DOM 投影。所有 `<iframe>` / `<frame>` 内容（包括同源）暂不在范围内：观察会设置 `truncated` 并给出原因 `iframe-not-traversed`。未实现 closed shadow root 交互。
 - `visualObserve` 只做捕获（像素 + Set-of-Mark 标签）；视觉理解由 DSH Harness 的视觉模型完成。
-- 不读取现有 Profile、Cookie、扩展或已登录 Tab。
+- 驱动不会接管现有浏览器 Profile、浏览器扩展或已登录 Tab。登录态只能通过显式授权的 `storageState` 选项预加载（见导航策略一节）；注入的 Cookie 按 host 作用域发送，会到达该 host 的所有端口与协议。
 - 已验收路径是 Headless；Headful 参数存在，但尚未获得同等集成覆盖。
 - 确定性风险匹配只是拒绝层，不是完整的用户审批系统；上层 QA 工作流仍需自己的授权策略。
 

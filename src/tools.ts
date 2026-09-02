@@ -193,7 +193,7 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
 
   const browserObserve = tool<{ max_nodes?: number }, BrowserObservation>({
     name: 'browser_observe',
-    description: 'Return a bounded semantic view of the active page. Interactive nodes carry opaque refs tied to this Agent, page, observation epoch, fingerprint, and short expiry. Observe again after every action.',
+    description: 'Return a bounded semantic view of the active page main frame only: iframe content is never included (its presence sets truncated), and hidden or zero-size elements are excluded. At most 500 selector matches are scanned; whenever a visible match could not be emitted - scan window, node or byte budget, or an iframe - truncated is true and truncationReasons names every cause, so an absent node is never silently read as absent from the page. Editable controls carry a bounded value; secret-bearing fields (passwords, autocomplete secrets, CSS-masked fields) are marked valueWithheld and never exposed. Interactive nodes carry opaque refs tied to this Agent, page, observation epoch, fingerprint, and short expiry. Observe again after every dispatched action.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -223,7 +223,7 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
     option?: string
   }, BrowserActionReceipt>({
     name: 'browser_act',
-    description: 'Perform exactly one browser action. click/fill/press/scroll(ref)/select/hover require a ref from the latest browser_observe; the driver live re-resolves and hit-tests it (scroll resolves without a hit-test so it can reach off-viewport targets). scroll(direction) pages the viewport without a ref. select fires real input/change events and matches an option by accessible label first and exact value second, failing (not guessing) when ambiguous or missing. Every action invalidates the observation, so observe again after acting. Deterministic policy rejects destructive, financial, publish/send, credential, file-upload, and download semantics. Every call returns a confirmed/unknown/rejected/failed receipt.',
+    description: 'Perform exactly one browser action. click/fill/press/scroll(ref)/select/hover require a ref from the latest browser_observe; the driver acts on the original observed DOM node and re-verifies its identity (removal or replacement rejects, never a silent click on a lookalike), then hit-tests it (scroll resolves without a hit-test so it can reach off-viewport targets; an off-viewport click rejects TARGET_OFF_VIEWPORT). scroll(direction) pages the viewport without a ref. select fires real input/change events and matches an option by accessible label first and exact value second, failing (not guessing) when ambiguous or missing. Every dispatched action invalidates the observation, so observe again after acting. Deterministic policy rejects destructive, financial, publish/send, credential, file-upload, and download semantics. Every call returns a confirmed/unknown/rejected/failed receipt.',
     parameters: {
       type: 'object',
       additionalProperties: false,
