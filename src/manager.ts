@@ -1131,16 +1131,25 @@ export class BrowserManager implements ZSevenBrowserDriver {
   async #hitTest(handle: ElementHandle<Element>): Promise<void> {
     const visible = await handle.isVisible().catch(() => false)
     if (!visible) throw new DriverIssue('TARGET_NOT_VISIBLE', 'the live target is not visible', true)
-    const hit = await handle.evaluate((element) => {
-      if (!element.isConnected) return false
+    const outcome = await handle.evaluate((element) => {
+      if (!element.isConnected) return 'detached' as const
       const rect = element.getBoundingClientRect()
-      if (rect.width <= 0 || rect.height <= 0) return false
+      if (rect.width <= 0 || rect.height <= 0) return 'zero-size' as const
+      // Playwright would scroll an off-viewport target into view before its
+      // own click; this driver deliberately does not (scroll is the primary
+      // reachability verb), so the truth is 'off-viewport', never 'occluded'.
+      const offViewport = rect.right <= 0 || rect.bottom <= 0 || rect.left >= window.innerWidth || rect.top >= window.innerHeight
+      if (offViewport) return 'off-viewport' as const
       const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2))
       const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2))
       const top = document.elementFromPoint(x, y)
-      return top !== null && (top === element || element.contains(top) || top.contains(element))
-    }).catch(() => false)
-    if (!hit) throw new DriverIssue('TARGET_OCCLUDED', 'center-point hit-test did not resolve to the live target', true)
+      const hit = top !== null && (top === element || element.contains(top) || top.contains(element))
+      return hit ? 'hit' as const : 'occluded' as const
+    }).catch(() => 'detached' as const)
+    if (outcome === 'off-viewport') {
+      throw new DriverIssue('TARGET_OFF_VIEWPORT', 'the live target is outside the viewport; scroll to it (by ref) and observe again before acting', true)
+    }
+    if (outcome !== 'hit') throw new DriverIssue('TARGET_OCCLUDED', 'center-point hit-test did not resolve to the live target', true)
   }
 
   async #capturePng(session: ManagedSession, fullPage: boolean, width: number, height: number, scale: number): Promise<Buffer> {

@@ -81,9 +81,12 @@ test('scroll, select, and hover actions reach and mutate real page state', { tim
     assert.ok(deep)
     assert.equal(deep.inViewport, false, 'deep target starts below the fold')
 
+    // Scroll-first is intentional: an off-viewport click rejects with the
+    // truthful TARGET_OFF_VIEWPORT (not a misleading TARGET_OCCLUDED), and
+    // the scroll-by-ref verb is what reaches it.
     const beforeScroll = await manager.act('owner', { kind: 'click', ref: deep.ref })
     assert.equal(beforeScroll.status, 'rejected', JSON.stringify(beforeScroll))
-    assert.equal(beforeScroll.code, 'TARGET_OCCLUDED')
+    assert.equal(beforeScroll.code, 'TARGET_OFF_VIEWPORT')
 
     const scrolled = await manager.act('owner', { kind: 'scroll', ref: deep.ref })
     assert.equal(scrolled.status, 'confirmed', JSON.stringify(scrolled))

@@ -260,10 +260,15 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       const tag = element.tagName.toLowerCase()
       const inputType = tag === 'input' ? (element.getAttribute('type') ?? 'text').toLowerCase() : ''
       const role = normalize(element.getAttribute('role')) || implicitRole(element)
-      const editable = tag === 'input' || tag === 'textarea' || html.isContentEditable
+      // :disabled covers fieldset-disabled controls, and :read-only covers
+      // readonly inputs/textareas, so a fill on them fails fast instead of
+      // stalling in an actionability wait it can never satisfy.
+      const nativeDisabled = element.matches(':disabled')
+      const readOnly = (tag === 'input' || tag === 'textarea') && element.matches(':read-only')
+      const editable = (tag === 'input' || tag === 'textarea' || html.isContentEditable) && !readOnly && !nativeDisabled
       const interactive = editable || ['a', 'button', 'select', 'summary'].includes(tag)
         || element.hasAttribute('tabindex') || role !== 'generic' && role !== 'heading'
-      const disabled = element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true'
+      const disabled = element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || nativeDisabled
       const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
       const href = safeHref(element)
       output.push({
@@ -383,7 +388,9 @@ export async function inspectSemanticHandle(
     const tag = element.tagName.toLowerCase()
     const inputType = tag === 'input' ? (element.getAttribute('type') ?? 'text').toLowerCase() : ''
     const role = normalize(element.getAttribute('role')) || implicitRole()
-    const editable = tag === 'input' || tag === 'textarea' || html.isContentEditable
+    const nativeDisabled = element.matches(':disabled')
+    const readOnly = (tag === 'input' || tag === 'textarea') && element.matches(':read-only')
+    const editable = (tag === 'input' || tag === 'textarea' || html.isContentEditable) && !readOnly && !nativeDisabled
     const interactive = editable || ['a', 'button', 'select', 'summary'].includes(tag)
       || element.hasAttribute('tabindex') || role !== 'generic' && role !== 'heading'
     const href = safeHref()
@@ -396,7 +403,7 @@ export async function inspectSemanticHandle(
       inputType,
       interactive,
       editable,
-      disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true',
+      disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || nativeDisabled,
       inViewport,
       download: element.hasAttribute('download'),
       ...(href === undefined ? {} : { href }),

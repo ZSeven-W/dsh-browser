@@ -108,7 +108,15 @@ export interface BrowserSemanticNode {
   name: string
   tag: string
   interactive: boolean
+  /**
+   * True when the element accepts typed input: an enabled (not attribute-,
+   * fieldset-, or otherwise disabled) `<input>`/`<textarea>` that is not
+   * readonly, or a contenteditable element. Readonly and disabled controls
+   * are advertised non-editable so a fill fails fast with
+   * TARGET_NOT_EDITABLE instead of stalling in an actionability wait.
+   */
   editable: boolean
+  /** True when the control is disabled by attribute, aria-disabled, or a disabled fieldset. */
   disabled: boolean
   /**
    * Whether the element's box currently intersects the viewport. Off-viewport
