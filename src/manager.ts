@@ -814,7 +814,20 @@ export class BrowserManager implements ZSevenBrowserDriver {
               } else if (action.kind === 'fill') {
                 dispatched = true
                 await this.#abortClosesSession(active, signal, resolved.handle.fill(action.text, { timeout: this.#actionTimeoutMs }))
-                const liveValue = await resolved.handle.inputValue()
+                // Native value controls verify via inputValue(); contenteditable
+                // has no .value (inputValue() throws), so verify the text
+                // content the fill wrote, with innerText as fallback.
+                const nativeValueControl = resolved.target.tag === 'input' || resolved.target.tag === 'textarea' || resolved.target.tag === 'select'
+                let liveValue: string
+                if (nativeValueControl) {
+                  liveValue = await resolved.handle.inputValue()
+                } else {
+                  const text = await resolved.handle.evaluate((element) => ({
+                    textContent: element.textContent ?? '',
+                    innerText: (element as HTMLElement).innerText ?? '',
+                  }))
+                  liveValue = text.textContent === action.text || text.innerText === action.text ? action.text : text.textContent
+                }
                 status = liveValue === action.text ? 'confirmed' : 'failed'
                 verification = {
                   kind: 'value-match',

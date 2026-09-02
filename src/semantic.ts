@@ -222,11 +222,14 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
      * and the caller receives the explicit `valueWithheld` marker instead.
      */
     const observableValue = (element: Element, inputType: string): Record<string, unknown> => {
+      const html = element as HTMLElement
       const nativeValue = element instanceof HTMLInputElement
         ? (valuelessInputTypes.includes(inputType) ? null : element.value)
         : element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement
           ? element.value
-          : null
+          : html.isContentEditable
+            ? element.textContent
+            : null
       const ariaText = String(element.getAttribute('aria-valuetext') ?? '')
       const ariaNow = String(element.getAttribute('aria-valuenow') ?? '')
       const aria = ariaText.trim() === '' ? ariaNow : ariaText

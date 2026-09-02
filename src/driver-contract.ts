@@ -126,8 +126,9 @@ export interface BrowserSemanticNode {
    * already carried by `name`, or a fake upload path), `<textarea>`,
    * `<select>` (the selected option's `value`, which HTML defaults to the
    * option's text when the option carries no `value` attribute; for a
-   * `multiple` select, the first selected option), and any element carrying
-   * `aria-valuetext`/`aria-valuenow`.
+   * `multiple` select, the first selected option), any element carrying
+   * `aria-valuetext`/`aria-valuenow`, and `contenteditable` elements (their
+   * `textContent`, with the same secret withholding and 180-character bound).
    *
    * An empty string is a real observation ("this field is empty"); the ABSENCE
    * of the field means the element has no observable value at all, or that its
