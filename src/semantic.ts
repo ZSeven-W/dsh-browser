@@ -1,5 +1,5 @@
 import { createHash, createHmac } from 'node:crypto'
-import type { ElementHandle, Page } from 'playwright-core'
+import type { ElementHandle, JSHandle, Page } from 'playwright-core'
 import type { BrowserSemanticNode } from './driver-contract.js'
 
 export const SEMANTIC_SELECTOR = [
@@ -101,6 +101,7 @@ export function publicSemanticNode(target: StoredSemanticTarget): BrowserSemanti
     editable: target.editable,
     disabled: target.disabled,
     inViewport: target.inViewport,
+    bindable: target.handle !== undefined,
     ...(target.href === undefined ? {} : { href: target.href }),
     ...(target.valueWithheld === true
       ? { valueWithheld: true as const }
@@ -121,9 +122,48 @@ export interface SemanticScanResult {
   scanned: number
 }
 
-/** Bounded DOM semantic projection. It never returns selectors or element ids. */
-export async function collectSemanticCandidates(page: Page, scanLimit = 500): Promise<SemanticScanResult> {
-  const raw = await page.locator(SEMANTIC_SELECTOR).evaluateAll((elements, limit) => {
+export interface SemanticCollectOptions {
+  /** Maximum selector matches to examine, in piercing document order. */
+  scanLimit: number
+  /** Maximum emitted candidates; the element selection stops exactly here. */
+  maxNodes: number
+  /** Legacy: also serialize the candidate's position in the full match list. */
+  includeMatchIndex?: boolean
+}
+
+export interface SemanticCollectResult extends SemanticScanResult {
+  /** ElementHandles index-aligned with `candidates`, materialized in ONE round trip. */
+  handles: Array<ElementHandle<Element>>
+  /** True when a visible candidate was dropped by the node budget. */
+  nodeBudgetExceeded: boolean
+}
+
+/**
+ * Atomic bounded DOM semantic projection + handle capture. ONE page-side
+ * evaluation — the only round trip that touches the page before handle
+ * materialization — scans up to `scanLimit` piercing matches, serializes the
+ * emitted candidates, applies the node budget, and RETURNS references
+ * to exactly the selected elements as part of its result. Open shadow roots
+ * are pierced by the same composed-tree walk the locator engine used to
+ * provide, but the walk happens inside this one synchronous evaluation, so a
+ * DOM mutation can never desynchronize selection from serialization (a
+ * two-phase selector resolution could observe a stale match list under rapid
+ * churn). ElementHandles are then materialized for only those ≤ maxNodes
+ * elements in ONE round trip (getProperties on the retained array). There is
+ * no full-page handle materialization, no second selector query, and no index
+ * re-verification: the handles ARE the serialized elements by construction. A
+ * node whose handle still cannot be produced stays in the observation and is
+ * marked bindable:false by the caller — it is never silently dropped.
+ */
+export async function collectSemanticTargets(page: Page, options: SemanticCollectOptions): Promise<SemanticCollectResult> {
+  const { scanLimit, maxNodes, includeMatchIndex = false } = options
+  const capture = await page.evaluateHandle((args) => {
+    const {
+      selector,
+      scanLimit: limit,
+      maxNodes: nodeBudget,
+      includeMatchIndex: withMatchIndex,
+    } = args
     const normalize = (value: string | null | undefined, max = 180): string => String(value ?? '')
       .replace(/\s+/gu, ' ')
       .trim()
@@ -181,10 +221,10 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
           if (previous.tagName === current.tagName) nth += 1
           previous = previous.previousElementSibling
         }
-        parts.unshift(`${tag}:nth-of-type(${nth})`)
+        parts.unshift(tag + ':nth-of-type(' + nth + ')')
         current = current.parentElement
       }
-      return `html > ${parts.join(' > ')}`
+      return 'html > ' + parts.join(' > ')
     }
     const safeHref = (element: Element): string | undefined => {
       const value = element.getAttribute('href')
@@ -248,8 +288,33 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
         ...(collapsed.length > VALUE_MAX || raw.length > bounded.length ? { valueTruncated: true } : {}),
       }
     }
+    /**
+     * Piercing match collection in composed-tree order: light-tree document
+     * order, descending into every OPEN shadow root at its host's position —
+     * the same reach the locator engine had, executed in this synchronous
+     * evaluation so no later DOM mutation can invalidate the list.
+     */
+    const collectMatches = (selector: string): Element[] => {
+      const results: Element[] = []
+      const visit = (root: Document | ShadowRoot): void => {
+        const documentNode = root instanceof Document ? root : root.ownerDocument
+        const walker = documentNode.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+        let node = walker.nextNode()
+        while (node !== null) {
+          const element = node as Element
+          if (element.matches(selector)) results.push(element)
+          if (element.shadowRoot !== null) visit(element.shadowRoot)
+          node = walker.nextNode()
+        }
+      }
+      visit(document)
+      return results
+    }
+    const elements = collectMatches(selector)
     const output: Array<Record<string, unknown>> = []
+    const selected: Element[] = []
     const scanned = Math.min(elements.length, Number(limit))
+    let nodeBudgetExceeded = false
     for (let matchIndex = 0; matchIndex < scanned; matchIndex += 1) {
       const element = elements[matchIndex] as Element
       const html = element as HTMLElement
@@ -257,9 +322,15 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       const rect = element.getBoundingClientRect()
       if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) continue
       if (rect.width <= 0 || rect.height <= 0 || element.getClientRects().length === 0) continue
+      // The candidate at this position is visible and cannot be emitted: the
+      // node budget dropped it, exactly like the caller's emission loop.
+      if (selected.length >= nodeBudget) {
+        nodeBudgetExceeded = true
+        break
+      }
       const tag = element.tagName.toLowerCase()
       const inputType = tag === 'input' ? (element.getAttribute('type') ?? 'text').toLowerCase() : ''
-      const role = normalize(element.getAttribute('role')) || implicitRole(element)
+      const role = normalize(element.getAttribute('role'), 60) || implicitRole(element)
       // :disabled covers fieldset-disabled controls, and :read-only covers
       // readonly inputs/textareas, so a fill on them fails fast instead of
       // stalling in an actionability wait it can never satisfy.
@@ -271,21 +342,52 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
       const disabled = element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || nativeDisabled
       const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
       const href = safeHref(element)
-      output.push({
-        selector: selectorFor(element), matchIndex, role, name: accessibleName(element), tag, inputType,
+      const candidate: Record<string, unknown> = {
+        selector: selectorFor(element), role, name: accessibleName(element), tag, inputType,
         interactive, editable, disabled, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
         ...observableValue(element, inputType),
-      })
+        ...(withMatchIndex ? { matchIndex } : {}),
+      }
+      output.push(candidate)
+      selected.push(element)
     }
-    return { output, totalMatches: elements.length, scanned }
-  }, scanLimit)
+    // Selection, serialization, and retention happened in this same
+    // synchronous evaluation, so no DOM mutation can separate them: the
+    // retained array IS the serialized candidates, by construction. The byte
+    // budget is applied by the caller on the real public nodes (whose bytes it
+    // computes exactly), so nodes trimmed there simply lose their handle.
+    return { output, totalMatches: elements.length, scanned, nodeBudgetExceeded, selected }
+  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex })
 
-  return {
-    candidates: raw.output.map((value) => ({
+  // Pull the serialized projection and the retained element array out of the
+  // single capture handle, then materialize ElementHandles for ONLY those
+  // retained elements in one getProperties round trip.
+  let raw: {
+    output: Array<Record<string, unknown>>
+    totalMatches: number
+    scanned: number
+    nodeBudgetExceeded: boolean
+  }
+  let selectedHandle: JSHandle<Element[]>
+  try {
+    ;[raw, selectedHandle] = await Promise.all([
+      capture.evaluate((value) => ({
+        output: value.output,
+        totalMatches: value.totalMatches,
+        scanned: value.scanned,
+        nodeBudgetExceeded: value.nodeBudgetExceeded === true,
+      })),
+      capture.getProperty('selected') as Promise<JSHandle<Element[]>>,
+    ])
+  } finally {
+    await capture.dispose().catch(() => {})
+  }
+
+  const candidates: RawSemanticCandidate[] = raw.output.map((value) => ({
     selector: String(value.selector),
-    matchIndex: Number(value.matchIndex),
+    ...(typeof value.matchIndex === 'number' ? { matchIndex: Number(value.matchIndex) } : {}),
     role: compact(String(value.role || 'generic'), 60),
     name: compact(String(value.name || ''), 180),
     tag: compact(String(value.tag || ''), 30),
@@ -304,9 +406,54 @@ export async function collectSemanticCandidates(page: Page, scanLimit = 500): Pr
             ...(value.valueTruncated === true ? { valueTruncated: true as const } : {}),
           }
         : {}),
-    })),
-    totalMatches: raw.totalMatches,
-    scanned: raw.scanned,
+  }))
+  // The array is exactly the serialized candidates, so the handles are the
+  // serialized elements by construction — no index re-verification.
+  let handles: Array<ElementHandle<Element>> = []
+  try {
+    const properties = await selectedHandle.getProperties()
+    for (let index = 0; ; index += 1) {
+      const property = properties.get(String(index))
+      if (property === undefined) break
+      const element = property.asElement()
+      if (element !== null) handles.push(element)
+      else void property.dispose().catch(() => {})
+    }
+  } catch {
+    // Only a document replacement between the capture evaluation and handle
+    // materialization can destroy the retained array. Release whatever was
+    // materialized; the caller keeps the nodes and marks them bindable:false.
+    for (const handle of handles) void handle.dispose().catch(() => {})
+    handles = []
+  } finally {
+    await selectedHandle.dispose().catch(() => {})
+  }
+  return {
+    candidates,
+    handles,
+    totalMatches: Number(raw.totalMatches),
+    scanned: Number(raw.scanned),
+    nodeBudgetExceeded: raw.nodeBudgetExceeded,
+  }
+}
+
+/**
+ * Legacy candidates-only scan (kept for the exported API surface): the same
+ * piercing projection and budgets disabled, candidates carrying their match
+ * position exactly like before. The handles materialized along the way are
+ * disposed here because this caller never keeps them.
+ */
+export async function collectSemanticCandidates(page: Page, scanLimit = 500): Promise<SemanticScanResult> {
+  const collected = await collectSemanticTargets(page, {
+    scanLimit,
+    maxNodes: Number.MAX_SAFE_INTEGER,
+    includeMatchIndex: true,
+  })
+  for (const handle of collected.handles) void handle.dispose().catch(() => {})
+  return {
+    candidates: collected.candidates,
+    totalMatches: collected.totalMatches,
+    scanned: collected.scanned,
   }
 }
 

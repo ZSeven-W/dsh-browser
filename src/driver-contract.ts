@@ -1,7 +1,7 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 6 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 7 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
@@ -101,7 +101,9 @@ export interface BrowserSemanticNode {
    * bound to the ORIGINAL DOM node observed: if that node is removed and an
    * identical twin takes its place, acting on the ref rejects (TARGET_CHANGED)
    * instead of silently re-resolving to the twin; Set-of-Mark boxes are
-   * measured on the same original node.
+   * measured on the same original node. When the observation retained no live
+   * binding at all (bindable:false), acting on the ref rejects with
+   * TARGET_UNBINDABLE.
    */
   ref: string
   role: string
@@ -124,6 +126,16 @@ export interface BrowserSemanticNode {
    * from a viewport `visualObserve` capture with reason `off-viewport`.
    */
   inViewport: boolean
+  /**
+   * v7+: whether the observation retained a live binding to the ORIGINAL node,
+   * so `act` can reach it. False only when the driver could not produce an
+   * ElementHandle for a node it collected (for example the page was replaced
+   * mid-observation): the node stays in the observation for view purposes,
+   * `act` on its ref rejects with TARGET_UNBINDABLE, and `visualObserve`
+   * omits it with reason `unbound`. With the atomic capture (v7) this is
+   * exceptional, not a churn artifact.
+   */
+  bindable: boolean
   /** Query strings and fragments are removed. */
   href?: string
   /**
@@ -195,9 +207,11 @@ export interface BrowserObservation {
   /**
    * Present when truncated is true; names every reason the view is partial.
    * Reasons: scan-window-exceeded, node-budget-exceeded,
-   * byte-budget-exceeded, identity-binding-failed, iframe-not-traversed
-   * (the projection is main-frame only; any iframe/frame element, same-origin
-   * included, sets truncated).
+   * byte-budget-exceeded, iframe-not-traversed (the projection is main-frame
+   * only; any iframe/frame element, same-origin included, sets truncated).
+   * v6's identity-binding-failed is retired: v7 never drops a collected node
+   * because a handle could not be made — such a node stays with
+   * bindable:false instead.
    */
   truncationReasons?: string[]
   limits: {

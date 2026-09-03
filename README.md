@@ -86,16 +86,16 @@ Link or install this directory through the normal DSH local-plugin workflow; no 
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 6
+  BROWSER_DRIVER_CONTRACT_VERSION, // 7
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-The service advertises `kind: "browser"` and `contractVersion: 6`. Its `visualObserve` method captures a bounded PNG plus Set-of-Mark labels for the latest observation; it returns pixels and boxes only — no understanding, OCR, or diffing. Consumers should obtain it with Cordis injection (`ctx.inject([BROWSER_DRIVER_SERVICE], ...)`) and must not import manager internals or share model refs between Agents. `disposeScope(ownerId)` drains a late start as well as an active session; the plugin invokes it from the structural `agent/disposed` lifecycle hook.
+The service advertises `kind: "browser"` and `contractVersion: 7` (v7: semantic nodes carry a `bindable` flag; see `BrowserSemanticNode`). Its `visualObserve` method captures a bounded PNG plus Set-of-Mark labels for the latest observation; it returns pixels and boxes only — no understanding, OCR, or diffing. Consumers should obtain it with Cordis injection (`ctx.inject([BROWSER_DRIVER_SERVICE], ...)`) and must not import manager internals or share model refs between Agents. `disposeScope(ownerId)` drains a late start as well as an active session; the plugin invokes it from the structural `agent/disposed` lifecycle hook.
 
 ## Verified scope and current limitations
 
-The local integration gate starts installed Chrome headlessly, runs two isolated Agent contexts against a local HTTP fixture, verifies semantic fill/click, stale and cross-Agent ref rejection, deterministic dangerous-action rejection, origin policy, evidence redaction, and temporary-profile cleanup. The packed smoke performs a real clean npm install and starts the installed package's managed browser.
+The local integration gate starts installed Chrome headlessly, runs two isolated Agent contexts against a local HTTP fixture, verifies semantic fill/click, stale and cross-Agent ref rejection, deterministic dangerous-action rejection, origin policy, evidence redaction, temporary-profile cleanup, and the atomic observe capture contract (one page-side selection + serialization, per-node handle materialization bounded by maxNodes, no full-page handle queries, observation soundness under 20ms DOM churn, open-shadow-root refs collected and actable). The packed smoke performs a real clean npm install and starts the installed package's managed browser.
 
 Initial limitations are intentional and should not be read as claims:
 

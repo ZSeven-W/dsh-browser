@@ -78,11 +78,12 @@ const semanticNodeSchema = closedObject({
   editable: { type: 'boolean' },
   disabled: { type: 'boolean' },
   inViewport: { type: 'boolean' },
+  bindable: { type: 'boolean' },
   href: { type: 'string' },
   value: { type: 'string' },
   valueWithheld: { type: 'boolean', const: true },
   valueTruncated: { type: 'boolean', const: true },
-}, ['ref', 'role', 'name', 'tag', 'interactive', 'editable', 'disabled', 'inViewport'])
+}, ['ref', 'role', 'name', 'tag', 'interactive', 'editable', 'disabled', 'inViewport', 'bindable'])
 const observationSchema = closedObject({
   ownerId: { type: 'string' },
   epoch: { type: 'integer' },

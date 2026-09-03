@@ -84,12 +84,12 @@ pnpm run smoke:pack
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 6
+  BROWSER_DRIVER_CONTRACT_VERSION, // 7
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-服务会声明 `kind: "browser"` 和 `contractVersion: 6`。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
+服务会声明 `kind: "browser"` 和 `contractVersion: 7`（v7：语义节点新增 `bindable` 标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
 
 ## 已验证范围与限制
 

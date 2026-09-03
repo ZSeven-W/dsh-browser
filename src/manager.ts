@@ -28,13 +28,12 @@ import type {
 import { BROWSER_DRIVER_CONTRACT_VERSION } from './driver-contract.js'
 import { classifyActionRisk, normalizeNavigationUrl } from './risk.js'
 import {
-  collectSemanticCandidates,
+  collectSemanticTargets,
   inspectSemanticHandle,
   observationFingerprint,
   opaqueRef,
   publicSemanticNode,
   semanticFingerprint,
-  SEMANTIC_SELECTOR,
   type RawSemanticCandidate,
   type StoredSemanticTarget,
 } from './semantic.js'
@@ -467,16 +466,32 @@ export class BrowserManager implements ZSevenBrowserDriver {
     const owner = validateOwner(ownerId)
     return this.#exclusive(owner, signal, async (session) => {
       const maxNodes = clampInt(options.maxNodes, 60, 1, 100)
-      const scan = await this.#abortClosesSession(session, signal, collectSemanticCandidates(session.page, 500))
+      // Atomic capture: ONE page-side evaluation serializes the candidates AND
+      // retains references to exactly the selected elements; ElementHandles for
+      // only those elements are then materialized in one round trip. Handles are
+      // index-aligned with candidates by construction, so a DOM mutation between
+      // the steps can never desynchronize them (see collectSemanticTargets).
+      const collect = () => this.#abortClosesSession(session, signal, collectSemanticTargets(session.page, {
+        scanLimit: 500,
+        maxNodes,
+      }))
+      let scan = await collect()
+      // Only a document replacement between the serializing evaluation and the
+      // handle-materializing evaluation can lose the retained references. Retry
+      // once; if it persists, keep every node and mark the observation truthful.
+      if (scan.candidates.length > 0 && scan.handles.length === 0) scan = await collect()
       const raw = scan.candidates
       const epoch = session.epoch + 1
       session.epoch = epoch
       const expiresAtMs = this.#now() + this.#observationTtlMs
       const targets: StoredSemanticTarget[] = []
       let bytes = 2
-      let nodeBudgetExceeded = false
+      let nodeBudgetExceeded = scan.nodeBudgetExceeded
       let byteBudgetExceeded = false
       for (const [index, candidate] of raw.entries()) {
+        // Defense-in-depth: the in-page selection already applied the node
+        // budget; the byte budget is applied here, exactly as before, on the
+        // real public nodes. Nodes the byte budget drops keep no handle.
         if (targets.length >= maxNodes) {
           nodeBudgetExceeded = raw.length > targets.length
           break
@@ -486,6 +501,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
           ...candidate,
           fingerprint,
           ref: opaqueRef(session.secret, epoch, fingerprint, index),
+          ...(scan.handles[index] === undefined ? {} : { handle: scan.handles[index] }),
         }
         const publicNode = publicSemanticNode(target)
         const nodeBytes = Buffer.byteLength(JSON.stringify(publicNode), 'utf8') + 1
@@ -496,15 +512,15 @@ export class BrowserManager implements ZSevenBrowserDriver {
         bytes += nodeBytes
         targets.push(target)
       }
+      // Handles the emission loop did not adopt are disposed here and nowhere
+      // else. A node whose handle could not be produced is KEPT and advertised
+      // bindable:false — it is never silently dropped from the observation.
+      for (let index = targets.length; index < scan.handles.length; index += 1) {
+        const handle = scan.handles[index]
+        if (handle !== undefined) void handle.dispose().catch(() => {})
+      }
       const rawUrl = session.page.url()
       const title = compact(await session.page.title().catch(() => ''), 300)
-      // Bind each emitted target to the Playwright element handle of the exact
-      // node it denotes. A ref must resolve to the ORIGINAL node identity, never
-      // to a selector re-match, so an identical twin sliding into the stored
-      // selector path cannot be substituted. A target whose binding cannot be
-      // verified is dropped and the observation is flagged truncated.
-      const bindingDropped = await this.#bindTargetHandles(session, targets)
-      if (bindingDropped > 0) targets.splice(0, targets.length, ...targets.filter((target) => target.handle !== undefined))
       const fingerprint = observationFingerprint(rawUrl, title, targets)
       const previous = session.observation
       session.observation = {
@@ -520,7 +536,6 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (scan.scanned < scan.totalMatches) truncationReasons.push('scan-window-exceeded')
       if (nodeBudgetExceeded) truncationReasons.push('node-budget-exceeded')
       if (byteBudgetExceeded) truncationReasons.push('byte-budget-exceeded')
-      if (bindingDropped > 0) truncationReasons.push('identity-binding-failed')
       // The projection is main-frame only: any iframe (same-origin included)
       // makes the view partial, and the reason is named so evidence can never
       // read 'absent' for content the driver did not look at.
@@ -602,7 +617,11 @@ export class BrowserManager implements ZSevenBrowserDriver {
         const row = measured.rows[index]
         let omitReason: string | undefined
         let markBox: BrowserFrame | undefined
-        if (!row) {
+        if (target.handle === undefined) {
+          // The observation kept this node but retained no live binding for it;
+          // a Set-of-Mark label drawn for it could not be tied to a real box.
+          omitReason = 'unbound'
+        } else if (!row) {
           omitReason = 'not-found'
         } else if (!row.found) {
           omitReason = 'not-found'
@@ -1066,7 +1085,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
     // substituted for the observed node.
     const handle = stored.handle
     if (!handle) {
-      throw new DriverIssue('TARGET_CHANGED', 'the observation retained no live binding for this ref; observe again', failureRejected)
+      // The node stays in the observation (bindable:false), so the ref exists —
+      // but acting on it can never be sound. Say exactly what happened.
+      throw new DriverIssue('TARGET_UNBINDABLE', 'the observation retained no live binding for this ref; observe again', failureRejected)
     }
     const connected = await this.#abortClosesSession(session, signal, handle.evaluate((element) => element.isConnected)).catch(() => false)
     if (!connected) {
@@ -1079,52 +1100,6 @@ export class BrowserManager implements ZSevenBrowserDriver {
     return { target: bound, handle }
   }
 
-
-  /**
-   * Capture a Playwright element handle for each emitted target, zipped by the
-   * match index recorded during collection, then verify — through the same
-   * piercing locator engine that collected the candidates, so open shadow
-   * roots index identically — that every handle still denotes the node at its
-   * index. Unused handles are disposed; targets whose binding cannot be
-   * verified keep no handle (the caller drops them and flags the observation).
-   * Fail closed: if capture throws, no target keeps a handle.
-   */
-  async #bindTargetHandles(session: ManagedSession, targets: StoredSemanticTarget[]): Promise<number> {
-    if (targets.length === 0) return 0
-    const indexes = targets.map((target) => target.matchIndex)
-    const allHandles: Array<ElementHandle<SVGElement | HTMLElement>> = await session.page.$$(SEMANTIC_SELECTOR)
-    try {
-      const picked: Array<ElementHandle<SVGElement | HTMLElement> | null> = indexes.map((index) => index === undefined ? null : allHandles[index] ?? null)
-      const used = new Set(picked.filter((handle): handle is ElementHandle<SVGElement | HTMLElement> => handle !== null))
-      for (const handle of allHandles) {
-        if (!used.has(handle)) void handle.dispose().catch(() => {})
-      }
-      // Verify against the live piercing match list. A plain
-      // document.querySelectorAll would order shadow-DOM nodes differently and
-      // could never see them, silently dropping every shadow target.
-      const verified = await session.page.locator(SEMANTIC_SELECTOR).evaluateAll(
-        (elements, args) => {
-          const [anchors, list] = args
-          return list.map((index, k) => anchors[k] != null && index !== undefined && (elements[index] as unknown as Element) === (anchors[k] as unknown as Element))
-        },
-        [picked, indexes] as const,
-      )
-      let dropped = 0
-      for (let k = 0; k < targets.length; k += 1) {
-        const handle = picked[k]
-        if (verified[k] === true && handle !== null && handle !== undefined) {
-          targets[k]!.handle = handle
-        } else {
-          dropped += 1
-          void handle?.dispose().catch(() => {})
-        }
-      }
-      return dropped
-    } catch {
-      for (const handle of allHandles) void handle.dispose().catch(() => {})
-      return targets.length
-    }
-  }
 
   async #disposeObservationHandles(observation: ObservationRecord | undefined): Promise<void> {
     if (!observation) return
@@ -1145,9 +1120,24 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (offViewport) return 'off-viewport' as const
       const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2))
       const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2))
-      const top = document.elementFromPoint(x, y)
-      const hit = top !== null && (top === element || element.contains(top) || top.contains(element))
-      return hit ? 'hit' as const : 'occluded' as const
+      // document.elementFromPoint retargets open-shadow content to its host and
+      // Node.contains never crosses the host->shadowRoot boundary, so pierce
+      // open shadow roots explicitly: when the topmost light-DOM node is a
+      // host, ask its shadow root what sits at the point and test that node,
+      // descending through nested shadow roots.
+      const hits = (node: Element | null): boolean => {
+        if (node === null) return false
+        if (node === element || element.contains(node) || node.contains(element)) return true
+        let cursor: Element | null = node
+        while (cursor !== null && cursor.shadowRoot !== null) {
+          const inner = cursor.shadowRoot.elementFromPoint(x, y)
+          if (inner === null) return false
+          if (inner === element || element.contains(inner) || inner.contains(element)) return true
+          cursor = inner
+        }
+        return false
+      }
+      return hits(document.elementFromPoint(x, y)) ? 'hit' as const : 'occluded' as const
     }).catch(() => 'detached' as const)
     if (outcome === 'off-viewport') {
       throw new DriverIssue('TARGET_OFF_VIEWPORT', 'the live target is outside the viewport; scroll to it (by ref) and observe again before acting', true)
