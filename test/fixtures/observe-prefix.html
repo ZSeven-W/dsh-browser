@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Observe prefix fixture</title>
+  <!--
+    Static page pinning the composed-tree emission order of observe().
+    Layout math (viewport 1280x800, every semantic control is a 240x24
+    block, body margin 0):
+      h1        0..40     (1 node)
+      shadow    40..160   (5 buttons, open shadow root)
+      specials  160..304  (6 value/href/disabled-bearing controls)
+      header    304..592  (12 buttons, ghosts interleaved)
+      spacer    592..1192 (600px, not semantic)
+      rows      1192..4072 (120 buttons, ghosts interleaved)
+    At scrollY=0 only the top region is in the viewport; after one page
+    (800px) down-scroll the top region is out and rows 0..16 are in.
+  -->
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    h1 { margin: 0; height: 40px; line-height: 40px; font-size: 24px; }
+    .box { display: block; width: 240px; height: 24px; margin: 0; padding: 0; box-sizing: border-box; }
+    #spacer { height: 600px; }
+  </style>
+</head>
+<body>
+  <h1>Observe prefix fixture</h1>
+  <div id="host"></div>
+  <input type="text" class="box" aria-label="Search box" value="alpha beta">
+  <input type="password" class="box" aria-label="Secret field" value="hunter2">
+  <a class="box" href="https://example.com/page?q=1#frag" aria-label="Docs link">Docs</a>
+  <select class="box" aria-label="Pick one">
+    <option selected>First</option>
+    <option>Second</option>
+  </select>
+  <button class="box" disabled aria-label="Disabled act">Disabled</button>
+  <textarea class="box" aria-label="Notes">  leading and trailing  </textarea>
+  <button class="box">header-0</button>
+  <button class="box">header-1</button>
+  <button class="box">header-2</button>
+  <button class="box">header-3</button>
+  <button class="box">header-4</button>
+  <button class="box">header-5</button>
+  <button class="box" style="display:none">ghost-0</button>
+  <button class="box" style="display:none">ghost-1</button>
+  <button class="box">header-6</button>
+  <button class="box">header-7</button>
+  <button class="box">header-8</button>
+  <button class="box">header-9</button>
+  <button class="box">header-10</button>
+  <button class="box">header-11</button>
+  <button class="box" style="display:none">ghost-2</button>
+  <div id="spacer"></div>
+  <div id="rows"></div>
+  <script>
+    // Open shadow root pierced by the composed-tree walk: its 5 buttons land
+    // in the emission order at the host's position, inside every budget.
+    const host = document.getElementById('host')
+    const shadowRoot = host.attachShadow({ mode: 'open' })
+    shadowRoot.innerHTML = Array.from({ length: 5 }, (_, i) =>
+      '<button id="shadow-act-' + i + '" style="display:block;width:240px;height:24px;margin:0;padding:0;box-sizing:border-box">shadow-act-' + i + '</button>'
+    ).join('')
+    // 120 row buttons with display:none ghosts interleaved inside the first
+    // 100 emitted nodes' span, plus one visibility:hidden control.
+    const rows = document.getElementById('rows')
+    let ghost = 3
+    for (let i = 0; i < 120; i += 1) {
+      if (i === 40 || i === 80 || i === 100 || i === 119) {
+        const hidden = document.createElement('button')
+        hidden.className = 'box'
+        hidden.style.display = 'none'
+        hidden.textContent = 'ghost-' + ghost
+        ghost += 1
+        rows.appendChild(hidden)
+      }
+      const row = document.createElement('button')
+      row.className = 'box'
+      row.textContent = 'row-' + i
+      rows.appendChild(row)
+    }
+    const invis = document.createElement('button')
+    invis.className = 'box'
+    invis.style.visibility = 'hidden'
+    invis.textContent = 'invis-btn'
+    rows.appendChild(invis)
+  </script>
+</body>
+</html>
