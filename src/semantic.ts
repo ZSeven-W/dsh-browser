@@ -129,6 +129,14 @@ export interface SemanticCollectOptions {
   maxNodes: number
   /** Legacy: also serialize the candidate's position in the full match list. */
   includeMatchIndex?: boolean
+  /**
+   * Optional live root element: when present, the projection is limited to
+   * the composed subtree rooted at this element (the element itself, its
+   * light-tree descendants, and every open shadow root inside), and the scan
+   * window, the node budget, and the iframe marker are all relative to that
+   * subtree. Omit for the whole-page projection.
+   */
+  root?: ElementHandle<Element>
 }
 
 export interface SemanticCollectResult extends SemanticScanResult {
@@ -136,6 +144,15 @@ export interface SemanticCollectResult extends SemanticScanResult {
   handles: Array<ElementHandle<Element>>
   /** True when a visible candidate was dropped by the node budget. */
   nodeBudgetExceeded: boolean
+  /**
+   * Present only when root was provided and the rooted collection was
+   * refused: 'not-element' when the root is not an Element node, 'detached'
+   * when it is an element no longer connected to the document. The caller
+   * fails closed on either; the whole-page path never sets it.
+   */
+  rootFailure?: 'not-element' | 'detached'
+  /** iframe/frame elements inside the traversed root, counted by the same piercing walk. */
+  iframeCount: number
 }
 
 /**
@@ -156,13 +173,14 @@ export interface SemanticCollectResult extends SemanticScanResult {
  * marked bindable:false by the caller — it is never silently dropped.
  */
 export async function collectSemanticTargets(page: Page, options: SemanticCollectOptions): Promise<SemanticCollectResult> {
-  const { scanLimit, maxNodes, includeMatchIndex = false } = options
+  const { scanLimit, maxNodes, includeMatchIndex = false, root } = options
   const capture = await page.evaluateHandle((args) => {
     const {
       selector,
       scanLimit: limit,
       maxNodes: nodeBudget,
       includeMatchIndex: withMatchIndex,
+      root: rootElement,
     } = args
     const normalize = (value: string | null | undefined, max = 180): string => String(value ?? '')
       .replace(/\s+/gu, ' ')
@@ -292,25 +310,54 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
      * Piercing match collection in composed-tree order: light-tree document
      * order, descending into every OPEN shadow root at its host's position —
      * the same reach the locator engine had, executed in this synchronous
-     * evaluation so no later DOM mutation can invalidate the list.
+     * evaluation so no later DOM mutation can invalidate the list. With a
+     * scope root the walk starts at that element (which is itself part of
+     * the subtree) instead of the document; iframe/frame elements are
+     * counted by the same walk so the subtree-relative truncation marker is
+     * atomically consistent with the collected candidates.
      */
-    const collectMatches = (selector: string): Element[] => {
+    const collectMatches = (selector: string, from: Document | Element): { results: Element[]; iframeCount: number } => {
       const results: Element[] = []
-      const visit = (root: Document | ShadowRoot): void => {
-        const documentNode = root instanceof Document ? root : root.ownerDocument
-        const walker = documentNode.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+      let iframeCount = 0
+      const visit = (rootNode: Document | ShadowRoot | Element): void => {
+        const documentNode = rootNode instanceof Document ? rootNode : rootNode.ownerDocument
+        if (documentNode === null) return
+        if (!(rootNode instanceof Document)) {
+          // A TreeWalker's nextNode() starts AFTER its root, so a non-document
+          // root must be processed explicitly: an element root is itself part
+          // of the subtree (and may match or pierce its own shadow root), a
+          // ShadowRoot root is not an Element and can never match.
+          if (rootNode instanceof Element) {
+            if (rootNode.matches(selector)) results.push(rootNode)
+            if (rootNode.tagName === 'IFRAME' || rootNode.tagName === 'FRAME') iframeCount += 1
+            if (rootNode.shadowRoot !== null) visit(rootNode.shadowRoot)
+          }
+        }
+        const walker = documentNode.createTreeWalker(rootNode, NodeFilter.SHOW_ELEMENT)
         let node = walker.nextNode()
         while (node !== null) {
           const element = node as Element
           if (element.matches(selector)) results.push(element)
+          if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') iframeCount += 1
           if (element.shadowRoot !== null) visit(element.shadowRoot)
           node = walker.nextNode()
         }
       }
-      visit(document)
-      return results
+      visit(from)
+      return { results, iframeCount }
     }
-    const elements = collectMatches(selector)
+    // Fail closed on an unusable scope root BEFORE any collection: the caller
+    // must be able to tell "the scope refused" apart from "the subtree is
+    // empty", and must never receive a whole-page fallback.
+    if (rootElement !== undefined) {
+      if (rootElement.nodeType !== 1) {
+        return { output: [], totalMatches: 0, scanned: 0, nodeBudgetExceeded: false, selected: [], iframeCount: 0, rootFailure: 'not-element' }
+      }
+      if (!rootElement.isConnected) {
+        return { output: [], totalMatches: 0, scanned: 0, nodeBudgetExceeded: false, selected: [], iframeCount: 0, rootFailure: 'detached' }
+      }
+    }
+    const { results: elements, iframeCount } = collectMatches(selector, rootElement ?? document)
     const output: Array<Record<string, unknown>> = []
     const selected: Element[] = []
     const scanned = Math.min(elements.length, Number(limit))
@@ -358,8 +405,8 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     // retained array IS the serialized candidates, by construction. The byte
     // budget is applied by the caller on the real public nodes (whose bytes it
     // computes exactly), so nodes trimmed there simply lose their handle.
-    return { output, totalMatches: elements.length, scanned, nodeBudgetExceeded, selected }
-  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex })
+    return { output, totalMatches: elements.length, scanned, nodeBudgetExceeded, selected, iframeCount }
+  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex, root })
 
   // Pull the serialized projection and the retained element array out of the
   // single capture handle, then materialize ElementHandles for ONLY those
@@ -369,6 +416,8 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     totalMatches: number
     scanned: number
     nodeBudgetExceeded: boolean
+    iframeCount: number
+    rootFailure?: 'not-element' | 'detached'
   }
   let selectedHandle: JSHandle<Element[]>
   try {
@@ -378,6 +427,10 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
         totalMatches: value.totalMatches,
         scanned: value.scanned,
         nodeBudgetExceeded: value.nodeBudgetExceeded === true,
+        iframeCount: Number(value.iframeCount ?? 0),
+        ...(value.rootFailure === 'not-element' || value.rootFailure === 'detached'
+          ? { rootFailure: value.rootFailure as 'not-element' | 'detached' }
+          : {}),
       })),
       capture.getProperty('selected') as Promise<JSHandle<Element[]>>,
     ])
@@ -434,6 +487,8 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     totalMatches: Number(raw.totalMatches),
     scanned: Number(raw.scanned),
     nodeBudgetExceeded: raw.nodeBudgetExceeded,
+    ...(raw.rootFailure === undefined ? {} : { rootFailure: raw.rootFailure }),
+    iframeCount: raw.iframeCount,
   }
 }
 

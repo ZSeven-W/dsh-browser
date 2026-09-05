@@ -1,7 +1,7 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 7 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 8 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
@@ -93,6 +93,33 @@ export interface BrowserSessionInfo {
 export interface BrowserObservationOptions {
   /** Maximum returned semantic nodes. The driver clamps this to 1..100. */
   maxNodes?: number
+  /**
+   * v8+: restrict the projection to the composed subtree rooted at this
+   * element. The value is an opaque ref from the caller's CURRENT observation
+   * (the latest unexpired one in this Agent scope). The driver resolves it
+   * exactly as actions do — same staleness/expiry rules, same rejection
+   * vocabulary — and then collects semantic nodes from that subtree only:
+   * the root element plus its descendants and every open shadow root inside,
+   * in the same composed-tree DOM order and with the same atomic
+   * handle-capture as the whole-page path. maxNodes, the byte ceiling, and
+   * the 500-match scan window all apply to the SUBTREE, and the iframe
+   * truncation marker only reflects iframes inside it — so a subtree that
+   * fits reports truncated:false, making absence provable inside a
+   * container even when the whole page is unbounded. The result's scope
+   * field echoes the root the driver observed. An unknown, expired,
+   * consumed, non-element, or detached within ref refuses the call with a
+   * distinct rejection — it never silently falls back to a whole-page view.
+   */
+  within?: string
+}
+
+/** v8+: the root of a scoped observation, as the driver observed it. */
+export interface BrowserObservationScope {
+  /** The ref the caller passed as within. */
+  ref: string
+  role: string
+  name: string
+  tag: string
 }
 
 export interface BrowserSemanticNode {
@@ -197,6 +224,14 @@ export interface BrowserObservation {
     title: string
     viewport: { width: number; height: number }
   }
+  /**
+   * v8+: the root of a scoped observation (observe with a within ref), as the
+   * driver observed it at resolution time. Null for a whole-page observation.
+   * nodes are collected from this element's composed subtree; budgets and the
+   * iframe marker are subtree-relative, while each node's inViewport keeps its
+   * whole-page viewport-intersection meaning.
+   */
+  scope: BrowserObservationScope | null
   nodes: BrowserSemanticNode[]
   /**
    * True whenever a selector-matching element that would have been emitted was
@@ -208,10 +243,12 @@ export interface BrowserObservation {
    * Present when truncated is true; names every reason the view is partial.
    * Reasons: scan-window-exceeded, node-budget-exceeded,
    * byte-budget-exceeded, iframe-not-traversed (the projection is main-frame
-   * only; any iframe/frame element, same-origin included, sets truncated).
-   * v6's identity-binding-failed is retired: v7 never drops a collected node
-   * because a handle could not be made — such a node stays with
-   * bindable:false instead.
+   * only; any iframe/frame element, same-origin included, sets truncated). In
+   * a scoped (within) observation every reason — the iframe marker included —
+   * is relative to the subtree: an iframe elsewhere on the page does not
+   * truncate the subtree view. v6's identity-binding-failed is retired: v7
+   * never drops a collected node because a handle could not be made — such a
+   * node stays with bindable:false instead.
    */
   truncationReasons?: string[]
   limits: {

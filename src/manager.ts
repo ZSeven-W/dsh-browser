@@ -489,20 +489,66 @@ export class BrowserManager implements ZSevenBrowserDriver {
     const owner = validateOwner(ownerId)
     return this.#exclusive(owner, signal, async (session) => {
       const maxNodes = clampInt(options.maxNodes, 60, 1, this.#observeMaxNodeCeiling())
+      // v8 scoped observation: resolve the within ref EXACTLY as actions do
+      // (same staleness/expiry rules, same rejection vocabulary), then root
+      // the collection at that element's composed subtree. A refused ref
+      // rejects the call — it never silently falls back to a whole-page view.
+      let scopeRoot: { ref: string; target: RawSemanticCandidate; handle: ElementHandle<Element> } | undefined
+      if (options.within !== undefined) {
+        if (typeof options.within !== 'string' || options.within.trim() === '' || options.within.length > 128) {
+          throw new DriverIssue('REF_INVALID', 'within must be a short opaque ref from the latest browser_observe', true)
+        }
+        const resolved = await this.#resolveTarget(session, options.within, signal, true)
+        const nodeType = await this.#abortClosesSession(
+          session,
+          signal,
+          resolved.handle.evaluate((element) => element.nodeType),
+        ).catch((error: unknown) => {
+          if (error instanceof DriverIssue) throw error
+          if (isDetachedElementError(error)) throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true)
+          throw error
+        })
+        if (nodeType !== 1) {
+          throw new DriverIssue('WITHIN_NOT_ELEMENT', 'the within ref resolved to a non-element DOM node; scoped observation requires an element', true)
+        }
+        scopeRoot = { ref: options.within, target: resolved.target, handle: resolved.handle }
+      }
       // Atomic capture: ONE page-side evaluation serializes the candidates AND
       // retains references to exactly the selected elements; ElementHandles for
       // only those elements are then materialized in one round trip. Handles are
       // index-aligned with candidates by construction, so a DOM mutation between
       // the steps can never desynchronize them (see collectSemanticTargets).
-      const collect = () => this.#abortClosesSession(session, signal, collectSemanticTargets(session.page, {
-        scanLimit: 500,
-        maxNodes,
-      }))
+      // With a scope root the same evaluation refuses a root that detached
+      // between resolution and collection or is not an element, so the caller
+      // can always tell a refusal apart from an empty subtree.
+      const collect = () => {
+        const operation = collectSemanticTargets(session.page, {
+          scanLimit: 500,
+          maxNodes,
+          ...(scopeRoot === undefined ? {} : { root: scopeRoot.handle }),
+        })
+        if (scopeRoot === undefined) return this.#abortClosesSession(session, signal, operation)
+        return this.#abortClosesSession(session, signal, operation).catch((error: unknown) => {
+          if (error instanceof DriverIssue) throw error
+          // A document replacement between resolution and collection destroys
+          // the root's execution context; fail closed, never fall back.
+          if (isDetachedElementError(error)) throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true)
+          throw error
+        })
+      }
       let scan = await collect()
+      const refuseRoot = (failure: NonNullable<typeof scan.rootFailure>): never => {
+        if (failure === 'not-element') throw new DriverIssue('WITHIN_NOT_ELEMENT', 'the within ref resolved to a non-element DOM node; scoped observation requires an element', true)
+        throw new DriverIssue('TARGET_CHANGED', 'the within element detached from the document before collection; observe again', true)
+      }
+      if (scan.rootFailure !== undefined) refuseRoot(scan.rootFailure)
       // Only a document replacement between the serializing evaluation and the
       // handle-materializing evaluation can lose the retained references. Retry
       // once; if it persists, keep every node and mark the observation truthful.
-      if (scan.candidates.length > 0 && scan.handles.length === 0) scan = await collect()
+      if (scan.candidates.length > 0 && scan.handles.length === 0) {
+        scan = await collect()
+        if (scan.rootFailure !== undefined) refuseRoot(scan.rootFailure)
+      }
       const raw = scan.candidates
       const epoch = session.epoch + 1
       session.epoch = epoch
@@ -561,8 +607,12 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (byteBudgetExceeded) truncationReasons.push('byte-budget-exceeded')
       // The projection is main-frame only: any iframe (same-origin included)
       // makes the view partial, and the reason is named so evidence can never
-      // read 'absent' for content the driver did not look at.
-      const iframeCount = await session.page.locator('iframe, frame').count()
+      // read 'absent' for content the driver did not look at. In a scoped
+      // observation only iframes INSIDE the subtree count: the collection walk
+      // counted them atomically with the candidates.
+      const iframeCount = scopeRoot === undefined
+        ? await session.page.locator('iframe, frame').count()
+        : scan.iframeCount
       if (iframeCount > 0) truncationReasons.push('iframe-not-traversed')
       this.#touch(session)
       return {
@@ -575,6 +625,14 @@ export class BrowserManager implements ZSevenBrowserDriver {
           title,
           viewport: { width: viewport.width, height: viewport.height },
         },
+        scope: scopeRoot === undefined
+          ? null
+          : {
+              ref: scopeRoot.ref,
+              role: scopeRoot.target.role,
+              name: scopeRoot.target.name,
+              tag: scopeRoot.target.tag,
+            },
         nodes: targets.map(publicSemanticNode),
         truncated: truncationReasons.length > 0,
         ...(truncationReasons.length > 0 ? { truncationReasons } : {}),

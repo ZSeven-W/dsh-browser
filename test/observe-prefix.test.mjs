@@ -31,6 +31,11 @@ const fixtureHtml = await readFile(
   'utf8',
 )
 
+const scopedFixtureHtml = await readFile(
+  fileURLToPath(new URL('./fixtures/observe-scoped.html', import.meta.url)),
+  'utf8',
+)
+
 // Every public node field except the observation-specific `ref`.
 const nodeFields = (node) => {
   const { ref, ...fields } = node
@@ -243,3 +248,81 @@ test('a 500-node request stays clamped to the 100-node ceiling while the benchma
   }
 })
 
+
+
+test('scoped observe on an unchanged page: the prefix property holds within a fixed scope', { timeout: 120_000 }, async (t) => {
+  try { await discoverInstalledBrowser() } catch (error) {
+    t.skip('installed Chrome/Edge/Chromium unavailable: ' + error.message)
+    return
+  }
+  let port = 0
+  const server = createServer((req, res) => {
+    const requestUrl = new URL(req.url, 'http://127.0.0.1:' + port)
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    if (requestUrl.pathname === '/scoped') return res.end(scopedFixtureHtml)
+    res.end('<h1>index</h1>')
+  })
+  port = await listen(server)
+  const origin = 'http://127.0.0.1:' + port
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-browser-scoped-prefix-'))
+  const manager = new BrowserManager({ rootDir, allowedOrigins: [origin], observationTtlMs: 120_000 })
+  // Reach the deep container the way a caller must: the whole-page window
+  // never contains it, the main-region scope emits it as its 100th node.
+  const chain = async () => {
+    const whole = await manager.observe('owner', { maxNodes: 100 })
+    const anchor = whole.nodes.find((node) => node.name === 'Scope anchor region')
+    assert.ok(anchor)
+    const narrow = await manager.observe('owner', { within: anchor.ref, maxNodes: 100 })
+    const container = narrow.nodes.find((node) => node.name === 'Deep container')
+    assert.ok(container, 'narrow scope must include the container')
+    return container
+  }
+  try {
+    await manager.start('owner', { url: origin + '/scoped' })
+
+    const smallContainer = await chain()
+    const scopedSmall = await manager.observe('owner', { within: smallContainer.ref, maxNodes: 5 })
+    const largeContainer = await chain()
+    const scopedLarge = await manager.observe('owner', { within: largeContainer.ref, maxNodes: 40 })
+
+    assert.equal(scopedSmall.nodes.length, 5, 'scoped observe(5) emits 5 subtree nodes')
+    assert.equal(scopedLarge.nodes.length, 32, 'scoped observe(40) emits the whole 32-node subtree')
+    assert.equal(scopedSmall.truncated, true, 'scoped observe(5) is partial')
+    assert.ok(scopedSmall.truncationReasons?.includes('node-budget-exceeded'), JSON.stringify(scopedSmall.truncationReasons))
+    assert.equal(scopedLarge.truncated, false, 'scoped observe(40) fits the subtree with no reasons')
+    assert.equal(scopedLarge.truncationReasons, undefined)
+    assert.equal(scopedSmall.limits.maxNodes, 5)
+    assert.equal(scopedLarge.limits.maxNodes, 40)
+    assert.notEqual(smallContainer.ref, largeContainer.ref, 'scope refs are re-minted per observation')
+
+    // Both scope echoes describe the same container, with their own ref.
+    assert.deepEqual(
+      { ...scopedSmall.scope, ref: undefined },
+      { ref: undefined, role: 'region', name: 'Deep container', tag: 'div' },
+      'scoped observe(5) scope echo',
+    )
+    assert.deepEqual(scopedLarge.scope, { ref: largeContainer.ref, role: 'region', name: 'Deep container', tag: 'div' })
+
+    // The deep target sits at subtree index 3, inside the 5-node prefix.
+    assert.equal(scopedSmall.nodes[3].name, 'Deep scoped target', 'deep target in the small prefix')
+    assert.equal(scopedLarge.nodes[3].name, 'Deep scoped target', 'deep target at the same index in the large view')
+
+    // Field-level prefix within the fixed scope: every field except ref must be
+    // identical over the shared prefix (inViewport included — the page is
+    // unchanged and un-scrolled between the two observations).
+    for (let i = 0; i < scopedSmall.nodes.length; i += 1) {
+      const diffs = differingFields(nodeFields(scopedSmall.nodes[i]), nodeFields(scopedLarge.nodes[i]))
+      assert.equal(
+        diffs.length,
+        0,
+        'scoped prefix index ' + i + ' differs in fields [' + diffs.join(', ') + ']: small=' + JSON.stringify(scopedSmall.nodes[i]) + ' large=' + JSON.stringify(scopedLarge.nodes[i]),
+      )
+      assert.notEqual(scopedSmall.nodes[i].ref, scopedLarge.nodes[i].ref, 'scoped prefix index ' + i + ' refs must be re-minted per observation')
+    }
+  } finally {
+    await manager.dispose().catch(() => {})
+    server.closeAllConnections?.()
+    await new Promise((resolve) => server.close(resolve))
+    await rm(rootDir, { recursive: true, force: true }).catch(() => {})
+  }
+})

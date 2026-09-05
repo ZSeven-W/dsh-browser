@@ -23,7 +23,7 @@ The exported `zsevenBrowserDriver` service is the stable orchestration surface i
 | Tool | Purpose |
 | --- | --- |
 | `browser_session_start` | Discover installed Chrome/Edge/Chromium and start one isolated context. |
-| `browser_observe` | Return a bounded semantic view with opaque epoch/fingerprint/expiry-bound refs. |
+| `browser_observe` | Return a bounded semantic view — whole-page, or scoped to one element's subtree via `within` — with opaque epoch/fingerprint/expiry-bound refs. |
 | `browser_act` | `click`, `fill`, `press`, `navigate`, `scroll`, `select`, or `hover` after live re-resolution and target checks. |
 | `browser_evidence` | Return bounded, redacted console and network metadata. |
 | `browser_session_stop` | Close the context and delete its exact temporary profile directory. |
@@ -36,6 +36,10 @@ Every `browser_act` result is a receipt with one of four states:
 - `failed`: the browser could not dispatch the action.
 
 `scroll` reaches off-viewport controls (by ref, centering the target) or pages the viewport (`direction` + optional `amount`); `select` chooses a native `<select>` option by accessible label first and exact value second, failing rather than guessing; `hover` holds the pointer over an element so a later observe sees hover-revealed content. Any dispatched action — including `scroll` — invalidates the observation, so observe again after acting.
+
+## Scoped observation (v8)
+
+The whole-page projection is clamped to 100 nodes and a 48 KiB emission budget, so a target deep in DOM order (a navbox link, a footer control) may never appear no matter what the viewport shows. `browser_observe` accepts an optional `within` ref from the latest observation: the driver resolves it exactly like an action ref (same staleness/expiry rules, same rejection vocabulary) and collects semantic nodes from the composed subtree rooted at that element instead of the whole page — same selector, same open-shadow-root piercing, same DOM-order emission, same atomic handle capture. `maxNodes`, the byte ceiling, the 500-match scan window, and the iframe truncation marker all become subtree-relative, so a subtree that fits reports `truncated: false` with no reasons: absence inside a container becomes provable. The result's `scope` echoes the root (`{ ref, role, name, tag }`; `null` for a whole-page observe) while each node's `inViewport` keeps its whole-page viewport meaning. Refusals fail closed and are never a whole-page fallback: `REF_INVALID` (malformed), `OBSERVATION_REQUIRED` (observation consumed), `REF_UNKNOWN` (unknown or consumed ref), `REF_EXPIRED`, `PAGE_CHANGED`, `TARGET_CHANGED` (detached or replaced), `TARGET_UNBINDABLE` (no live binding), and `WITHIN_NOT_ELEMENT` (non-element root).
 
 ## Operator navigation policy
 
@@ -86,12 +90,12 @@ Link or install this directory through the normal DSH local-plugin workflow; no 
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 7
+  BROWSER_DRIVER_CONTRACT_VERSION, // 8
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-The service advertises `kind: "browser"` and `contractVersion: 7` (v7: semantic nodes carry a `bindable` flag; see `BrowserSemanticNode`). Its `visualObserve` method captures a bounded PNG plus Set-of-Mark labels for the latest observation; it returns pixels and boxes only — no understanding, OCR, or diffing. Consumers should obtain it with Cordis injection (`ctx.inject([BROWSER_DRIVER_SERVICE], ...)`) and must not import manager internals or share model refs between Agents. `disposeScope(ownerId)` drains a late start as well as an active session; the plugin invokes it from the structural `agent/disposed` lifecycle hook.
+The service advertises `kind: "browser"` and `contractVersion: 8` (v8: `observe` accepts an optional `within` ref that scopes the projection to one element's composed subtree with subtree-relative budgets, and every observation reports its `scope`; v7 added the `bindable` node flag — see `BrowserSemanticNode`). Its `visualObserve` method captures a bounded PNG plus Set-of-Mark labels for the latest observation; it returns pixels and boxes only — no understanding, OCR, or diffing. Consumers should obtain it with Cordis injection (`ctx.inject([BROWSER_DRIVER_SERVICE], ...)`) and must not import manager internals or share model refs between Agents. `disposeScope(ownerId)` drains a late start as well as an active session; the plugin invokes it from the structural `agent/disposed` lifecycle hook.
 
 ## Verified scope and current limitations
 

@@ -16,7 +16,7 @@ function fakeDriver() {
       return { ownerId, state: 'running', headless: true, browser: { channel: 'chrome', version: 'fixture' }, page, isolation: 'ephemeral-user-data', navigationPolicy: { mode: 'allowlist', allowedOrigins: [] } }
     },
     async observe(ownerId) {
-      return { ownerId, epoch: 1, fingerprint: 'fp', expiresAt: '2026-08-24T00:00:00.000Z', page: { ...page, viewport: { width: 1280, height: 800 } }, nodes: [], truncated: false, limits: { maxNodes: 60, maxBytes: 49152 } }
+      return { ownerId, epoch: 1, fingerprint: 'fp', expiresAt: '2026-08-24T00:00:00.000Z', page: { ...page, viewport: { width: 1280, height: 800 } }, scope: null, nodes: [], truncated: false, limits: { maxNodes: 60, maxBytes: 49152 } }
     },
     async act(ownerId, action) {
       return { receiptId: 'r', ownerId, action: action.kind, status: 'confirmed', startedAt: '', completedAt: '', dispatched: true, pageBefore: page, pageAfter: page }

@@ -23,7 +23,7 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 | 工具 | 作用 |
 | --- | --- |
 | `browser_session_start` | 发现已安装的 Chrome / Edge / Chromium，启动独立 Context。 |
-| `browser_observe` | 返回有界语义视图，以及绑定 epoch / fingerprint / expiry 的 opaque ref。 |
+| `browser_observe` | 返回有界语义视图（整页，或通过 `within` 限定到某个元素的子树），以及绑定 epoch / fingerprint / expiry 的 opaque ref。 |
 | `browser_act` | 实时重新解析并校验目标后执行 `click`、`fill`、`press`、`navigate`、`scroll`、`select` 或 `hover`。 |
 | `browser_evidence` | 返回有界、脱敏的 Console 和 Network 元数据。 |
 | `browser_session_stop` | 关闭 Context，删除对应的精确临时用户目录。 |
@@ -36,6 +36,10 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 - `failed`：浏览器没能派发动作。
 
 `scroll` 可滚动到视口外控件（按 ref，将目标居中）或翻页（`direction` + 可选 `amount`）；`select` 先按可访问标签、再按精确 value 选择原生 `<select>` 选项，无法匹配时直接失败而非猜测；`hover` 将指针停留在元素上，便于后续观察看到悬停才显示的内容。任何已派发的动作（包括 `scroll`）都会使观察失效，因此每次动作后都要重新观察。
+
+## 限定范围观察（v8）
+
+整页投影被限制在 100 个节点和 48 KiB 输出预算内，因此 DOM 顺序深处的目标（如信息框链接、页脚控件）无论视口如何都永远无法出现。`browser_observe` 支持可选的 `within` ref（来自最新一次观察）：驱动像解析动作 ref 一样解析它（同样的过期/失效规则与拒绝词汇），随后只从该元素的 composed 子树收集语义节点 —— 相同的选择器、相同的 open shadow root 穿透、相同的 DOM 顺序输出与原子 handle 捕获。`maxNodes`、字节上限、500 匹配扫描窗口与 iframe 截断标记全部变为子树相对：子树完整装下时返回 `truncated: false` 且无任何原因，容器内的“不存在”从此可被证明。结果的 `scope` 回显根节点（`{ ref, role, name, tag }`；整页观察为 `null`），而每个节点的 `inViewport` 始终保持整页视口含义。拒绝一律 fail closed，绝不静默回退为整页视图：`REF_INVALID`（格式错误）、`OBSERVATION_REQUIRED`（观察已失效）、`REF_UNKNOWN`（未知或已消费的 ref）、`REF_EXPIRED`、`PAGE_CHANGED`、`TARGET_CHANGED`（已脱离或已被替换）、`TARGET_UNBINDABLE`（无活动绑定）以及 `WITHIN_NOT_ELEMENT`（根节点不是元素）。
 
 ## Operator 导航白名单
 
@@ -84,12 +88,12 @@ pnpm run smoke:pack
 ```ts
 import {
   BROWSER_DRIVER_SERVICE, // "zsevenBrowserDriver"
-  BROWSER_DRIVER_CONTRACT_VERSION, // 7
+  BROWSER_DRIVER_CONTRACT_VERSION, // 8
   type ZSevenBrowserDriver,
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-服务会声明 `kind: "browser"` 和 `contractVersion: 7`（v7：语义节点新增 `bindable` 标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
+服务会声明 `kind: "browser"` 和 `contractVersion: 8`（v8：`observe` 支持可选的 `within` ref，将投影限定到某个元素的 composed 子树并使用子树相对预算，每次观察都会报告 `scope`；v7 新增了 `bindable` 节点标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
 
 ## 已验证范围与限制
 
