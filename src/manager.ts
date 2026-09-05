@@ -86,6 +86,13 @@ interface ObservationRecord {
   rawUrl: string
   expiresAtMs: number
   targets: Map<string, StoredSemanticTarget>
+  /**
+   * Present only when a scoped observation's root was excluded from nodes by
+   * the visibility gate: the minted rootRef and its live binding, so the
+   * root stays resolvable through observe({ within: scope.rootRef }) even
+   * though the node list does not carry it.
+   */
+  scopeRoot?: { ref: string; target: StoredSemanticTarget }
 }
 
 interface ManagedSession {
@@ -98,6 +105,14 @@ interface ManagedSession {
   secret: Buffer
   epoch: number
   observation: ObservationRecord | undefined
+  /**
+   * The ORIGINAL ElementHandle of the last element a dispatched action ran
+   * against (identity anchor, never a re-matched node). Replaced on every
+   * dispatched act, cleared by acts without an element target and by
+   * navigation, released on session close.
+   * observe({ anchorLastAction: true }) measures it in-page.
+   */
+  lastActionTarget: ElementHandle<Element> | undefined
   console: BrowserConsoleEvidence[]
   network: BrowserNetworkEvidence[]
   consoleDropped: number
@@ -361,6 +376,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
         secret: randomBytes(32),
         epoch: 0,
         observation: undefined,
+        lastActionTarget: undefined,
         console: [],
         network: [],
         consoleDropped: 0,
@@ -497,6 +513,30 @@ export class BrowserManager implements ZSevenBrowserDriver {
     const owner = validateOwner(ownerId)
     return this.#exclusive(owner, signal, async (session) => {
       const maxNodes = clampInt(options.maxNodes, 60, 1, this.#observeMaxNodeCeiling())
+      // v9 identity anchor: observe({anchorLastAction:true}) measures — in-page,
+      // against the ORIGINAL acted handle — whether the last acted element is
+      // still connected and contained in the within subtree. No retained
+      // target is a distinct refusal, never a silent null anchor.
+      let anchorHandle: ElementHandle<Element> | undefined
+      if (options.anchorLastAction === true) {
+        anchorHandle = session.lastActionTarget
+        if (!anchorHandle) {
+          throw new DriverIssue('ANCHOR_UNAVAILABLE', 'no element has been acted on in this session yet; dispatch an action first, then observe with anchorLastAction', true)
+        }
+        const alive = await this.#abortClosesSession(
+          session,
+          signal,
+          anchorHandle.evaluate((element) => element.isConnected),
+        ).catch(() => null)
+        if (alive === null) {
+          // The retained handle's execution context no longer exists (a
+          // navigation raced the framenavigated release): release it and
+          // refuse the same way as when there is no anchor at all.
+          session.lastActionTarget = undefined
+          void anchorHandle.dispose().catch(() => {})
+          throw new DriverIssue('ANCHOR_UNAVAILABLE', 'the last acted element belonged to a document that no longer exists; act again, then observe', true)
+        }
+      }
       // v8 scoped observation: resolve the within ref EXACTLY as actions do
       // (same staleness/expiry rules, same rejection vocabulary), then root
       // the collection at that element's composed subtree. A refused ref
@@ -534,6 +574,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
           scanLimit: 500,
           maxNodes,
           ...(scopeRoot === undefined ? {} : { root: scopeRoot.handle }),
+          ...(anchorHandle === undefined ? {} : { anchor: anchorHandle }),
         })
         if (scopeRoot === undefined) return this.#abortClosesSession(session, signal, operation)
         return this.#abortClosesSession(session, signal, operation).catch((error: unknown) => {
@@ -554,6 +595,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
       // handle-materializing evaluation can lose the retained references. Retry
       // once; if it persists, keep every node and mark the observation truthful.
       if (scan.candidates.length > 0 && scan.handles.length === 0) {
+        // The retained array was destroyed by a document replacement; the
+        // first attempt's root handle (if any) belongs to that dead document.
+        if (scan.rootHandle !== undefined) void scan.rootHandle.dispose().catch(() => {})
         scan = await collect()
         if (scan.rootFailure !== undefined) refuseRoot(scan.rootFailure)
       }
@@ -574,11 +618,21 @@ export class BrowserManager implements ZSevenBrowserDriver {
           break
         }
         const fingerprint = semanticFingerprint(candidate)
+        // parentRef: the nearest emitted composed ancestor, by its ref in THIS
+        // observation. Ancestors always precede descendants in emission order,
+        // so a valid parentIndex is always already retained here; anything
+        // else fails safe to null.
+        const parentRef = candidate.parentIndex !== undefined
+          && candidate.parentIndex !== null
+          && candidate.parentIndex < targets.length
+          ? targets[candidate.parentIndex]?.ref ?? null
+          : null
         const target: StoredSemanticTarget = {
           ...candidate,
+          parentRef,
           fingerprint,
           ref: opaqueRef(session.secret, epoch, fingerprint, index),
-          ...(scan.handles[index] === undefined ? {} : { handle: scan.handles[index] }),
+          handle: scan.handles[index],
         }
         const publicNode = publicSemanticNode(target)
         const nodeBytes = Buffer.byteLength(JSON.stringify(publicNode), 'utf8') + 1
@@ -596,6 +650,34 @@ export class BrowserManager implements ZSevenBrowserDriver {
         const handle = scan.handles[index]
         if (handle !== undefined) void handle.dispose().catch(() => {})
       }
+      // v9 scope root identity: mint a FRESH ref for the root element in every
+      // scoped observation. When the root was emitted it is nodes[0] and
+      // rootRef equals its ref; when the visibility gate excluded it, the
+      // always-produced root candidate still mints a resolvable ref (index -1
+      // can never collide with a node ref) whose live binding is stored on
+      // the observation record alongside the node targets.
+      let scopeRootTarget: StoredSemanticTarget | undefined
+      let rootRef: string | undefined
+      if (scopeRoot !== undefined && scan.rootCandidate !== undefined) {
+        const rootFingerprint = semanticFingerprint(scan.rootCandidate)
+        const rootEmittedIndex = scan.rootEmittedIndex ?? -1
+        if (rootEmittedIndex >= 0 && rootEmittedIndex < targets.length) {
+          rootRef = targets[rootEmittedIndex]!.ref
+          // The emitted root's handle is scan.handles[rootEmittedIndex], owned
+          // by the target above; the separately materialized root handle is
+          // redundant and is released.
+          if (scan.rootHandle !== undefined) void scan.rootHandle.dispose().catch(() => {})
+        } else {
+          rootRef = opaqueRef(session.secret, epoch, rootFingerprint, -1)
+          scopeRootTarget = {
+            ...scan.rootCandidate,
+            parentRef: null,
+            fingerprint: rootFingerprint,
+            ref: rootRef,
+            handle: scan.rootHandle,
+          }
+        }
+      }
       const rawUrl = session.page.url()
       const title = compact(await session.page.title().catch(() => ''), 300)
       const fingerprint = observationFingerprint(rawUrl, title, targets)
@@ -606,6 +688,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
         rawUrl,
         expiresAtMs,
         targets: new Map(targets.map((target) => [target.ref, target])),
+        ...(scopeRootTarget === undefined ? {} : { scopeRoot: { ref: scopeRootTarget.ref, target: scopeRootTarget } }),
       }
       if (previous) void this.#disposeObservationHandles(previous)
       const viewport = session.page.viewportSize() ?? { width: 0, height: 0 }
@@ -613,6 +696,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (scan.scanned < scan.totalMatches) truncationReasons.push('scan-window-exceeded')
       if (nodeBudgetExceeded) truncationReasons.push('node-budget-exceeded')
       if (byteBudgetExceeded) truncationReasons.push('byte-budget-exceeded')
+      if (scan.slotUnresolved) truncationReasons.push('slot-unresolved')
       // The projection is main-frame only: any iframe (same-origin included)
       // makes the view partial, and the reason is named so evidence can never
       // read 'absent' for content the driver did not look at. In a scoped
@@ -623,6 +707,22 @@ export class BrowserManager implements ZSevenBrowserDriver {
         : scan.iframeCount
       if (iframeCount > 0) truncationReasons.push('iframe-not-traversed')
       this.#touch(session)
+      // hiddenMatchesPartial: the hidden count is exact only when nothing
+      // stopped the collection early (scan window, node budget, byte budget).
+      const hiddenMatches = Number(scan.hiddenMatches ?? 0)
+      const hiddenMatchesPartial = scan.scanned < scan.totalMatches || nodeBudgetExceeded || byteBudgetExceeded
+      let anchor: BrowserObservation['anchor']
+      if (anchorHandle !== undefined) {
+        const anchorIndex = scan.anchorIndex ?? -1
+        anchor = {
+          // The anchored element's fresh ref in THIS observation when it was
+          // emitted; null when the gate or a budget excluded it — the
+          // connected/contained fields stay truthful either way.
+          ref: anchorIndex >= 0 && anchorIndex < targets.length ? targets[anchorIndex]!.ref : null,
+          connected: scan.anchorInfo?.connected === true,
+          contained: scan.anchorInfo?.contained ?? null,
+        }
+      }
       return {
         ownerId: owner,
         epoch,
@@ -637,6 +737,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
           ? null
           : {
               ref: scopeRoot.ref,
+              rootRef: rootRef as string,
               role: scopeRoot.target.role,
               name: scopeRoot.target.name,
               tag: scopeRoot.target.tag,
@@ -645,6 +746,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
         truncated: truncationReasons.length > 0,
         ...(truncationReasons.length > 0 ? { truncationReasons } : {}),
         limits: { maxNodes, maxBytes: MAX_OBSERVATION_BYTES },
+        hiddenMatches,
+        hiddenMatchesPartial,
+        ...(anchor === undefined ? {} : { anchor }),
       }
     })
   }
@@ -1048,12 +1152,30 @@ export class BrowserManager implements ZSevenBrowserDriver {
           reason = compact(error instanceof Error ? error.message : String(error), 500)
         }
       } finally {
+        pageAfter = await pageSummary(active.page)
         if (dispatched) {
           const previous = active.observation
           active.observation = undefined
+          // v9 identity anchor: the ORIGINAL handle used for dispatch becomes
+          // the session's lastActionTarget. It is peeled out of the consumed
+          // observation record (whose remaining handles are disposed) so it
+          // survives the observation's release; acts without an element
+          // target (navigate, ref-less scroll) clear it, and a same-act
+          // navigation releases it (the URL check) — a stale handle would
+          // only cost a later ANCHOR_UNAVAILABLE refusal.
+          const priorAnchor = active.lastActionTarget
+          let nextAnchor: ElementHandle<Element> | undefined
+          if (previous && 'ref' in action && typeof action.ref === 'string' && pageAfter.url === pageBefore.url) {
+            const stored = previous.targets.get(action.ref)
+            if (stored?.handle !== undefined) {
+              nextAnchor = stored.handle
+              stored.handle = undefined
+            }
+          }
+          active.lastActionTarget = nextAnchor
+          if (priorAnchor !== undefined && priorAnchor !== nextAnchor) void priorAnchor.dispose().catch(() => {})
           void this.#disposeObservationHandles(previous)
         }
-        pageAfter = await pageSummary(active.page)
         if (!active.closed) this.#touch(active)
       }
 
@@ -1166,7 +1288,11 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (!observation) throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', failureRejected)
     if (this.#now() > observation.expiresAtMs) throw new DriverIssue('REF_EXPIRED', 'the semantic ref expired; observe again', failureRejected)
     if (session.page.url() !== observation.rawUrl) throw new DriverIssue('PAGE_CHANGED', 'the page URL changed after observation; observe again', failureRejected)
+    // v9: a gate-excluded scope root is not among the node targets, but its
+    // minted rootRef stays resolvable through the observation's scopeRoot
+    // binding (same staleness/expiry rules, same rejection vocabulary).
     const stored = observation.targets.get(ref)
+      ?? (observation.scopeRoot?.ref === ref ? observation.scopeRoot.target : undefined)
     if (!stored) throw new DriverIssue('REF_UNKNOWN', 'the ref is not part of the latest observation', failureRejected)
     // A ref binds to the ORIGINAL node identity: the element handle captured at
     // observation time. There is deliberately no selector re-resolution here —
@@ -1192,7 +1318,10 @@ export class BrowserManager implements ZSevenBrowserDriver {
 
   async #disposeObservationHandles(observation: ObservationRecord | undefined): Promise<void> {
     if (!observation) return
-    await Promise.allSettled([...observation.targets.values()].map((target) => target.handle?.dispose().catch(() => {})))
+    await Promise.allSettled([
+      ...[...observation.targets.values()].map((target) => target.handle?.dispose().catch(() => {})),
+      observation.scopeRoot?.target.handle?.dispose().catch(() => {}),
+    ])
   }
 
   async #hitTest(handle: ElementHandle<Element>): Promise<void> {
@@ -1319,6 +1448,14 @@ export class BrowserManager implements ZSevenBrowserDriver {
       else if (!session.closed) this.#scheduleClose(session)
     })
     page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) {
+        // Navigation destroys execution contexts: the retained identity
+        // anchor cannot be measured anymore, so it is released here (the
+        // anchorLastAction observe then refuses with ANCHOR_UNAVAILABLE).
+        const priorAnchor = session.lastActionTarget
+        session.lastActionTarget = undefined
+        if (priorAnchor) void priorAnchor.dispose().catch(() => {})
+      }
       if (frame !== page.mainFrame() || this.#originAllowed(frame.url())) return
       this.#pushConsole(session, 'origin-policy', `blocked top-level origin: ${publicPageUrl(frame.url())}`, frame.url())
       this.#scheduleClose(session)
@@ -1509,6 +1646,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (this.#sessions.get(session.ownerId) === session) this.#sessions.delete(session.ownerId)
       void this.#disposeObservationHandles(session.observation)
       session.observation = undefined
+      const priorAnchor = session.lastActionTarget
+      session.lastActionTarget = undefined
+      if (priorAnchor) void priorAnchor.dispose().catch(() => {})
       session.readyPages.clear()
       session.secret.fill(0)
       for (const cdp of session.policySessions) {

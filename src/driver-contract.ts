@@ -1,7 +1,7 @@
 /** Public driver contract consumed by dsh-qa and other orchestration plugins. */
 
 export const BROWSER_DRIVER_SERVICE = 'zsevenBrowserDriver' as const
-export const BROWSER_DRIVER_CONTRACT_VERSION = 8 as const
+export const BROWSER_DRIVER_CONTRACT_VERSION = 9 as const
 
 export type BrowserActionStatus = 'confirmed' | 'unknown' | 'rejected' | 'failed'
 export type BrowserActKind = 'click' | 'fill' | 'press' | 'navigate' | 'scroll' | 'select' | 'hover'
@@ -94,29 +94,53 @@ export interface BrowserObservationOptions {
   /** Maximum returned semantic nodes. The driver clamps this to 1..100. */
   maxNodes?: number
   /**
-   * v8+: restrict the projection to the composed subtree rooted at this
+   * v8+: restrict the projection to the flattened subtree rooted at this
    * element. The value is an opaque ref from the caller's CURRENT observation
-   * (the latest unexpired one in this Agent scope). The driver resolves it
-   * exactly as actions do — same staleness/expiry rules, same rejection
-   * vocabulary — and then collects semantic nodes from that subtree only:
-   * the root element plus its descendants and every open shadow root inside,
-   * in the same composed-tree DOM order and with the same atomic
-   * handle-capture as the whole-page path. maxNodes, the byte ceiling, and
-   * the 500-match scan window all apply to the SUBTREE, and the iframe
-   * truncation marker only reflects iframes inside it — so a subtree that
-   * fits reports truncated:false, making absence provable inside a
-   * container even when the whole page is unbounded. The result's scope
-   * field echoes the root the driver observed. An unknown, expired,
+   * (the latest unexpired one in this Agent scope) — including a scoped
+   * observation's own scope.rootRef (v9). The driver resolves it exactly as
+   * actions do — same staleness/expiry rules, same rejection vocabulary — and
+   * then collects semantic nodes from that subtree only: the root element
+   * plus its flattened-tree descendants (light children, slotted children at
+   * their assigned-slot render position, every open shadow root inside), in
+   * flattened-tree order and with the same atomic handle-capture as the
+   * whole-page path. maxNodes, the byte ceiling, and the 500-match scan
+   * window all apply to the SUBTREE, and the iframe truncation marker only
+   * reflects iframes inside it — so a subtree that fits reports
+   * truncated:false, making absence provable inside a container even when
+   * the whole page is unbounded. The result's scope field echoes the root
+   * the driver observed and carries a fresh rootRef (v9) that binds it even
+   * when the visibility gate excluded it from nodes. An unknown, expired,
    * consumed, non-element, or detached within ref refuses the call with a
    * distinct rejection — it never silently falls back to a whole-page view.
    */
   within?: string
+  /**
+   * v9: request an identity anchor for the element the driver last dispatched
+   * an action on (the ORIGINAL handle used for dispatch, never a re-matched
+   * node). The result's anchor reports, measured in-page against that handle,
+   * whether it is still connected and whether it lies inside the within
+   * subtree (composed containment; null without within), plus its fresh ref
+   * in THIS observation when it was emitted. When no action target is
+   * retained (no dispatched element action yet, or it was released by
+   * navigation), the call REJECTS with ANCHOR_UNAVAILABLE — never a silent
+   * null anchor.
+   */
+  anchorLastAction?: true
 }
 
 /** v8+: the root of a scoped observation, as the driver observed it. */
 export interface BrowserObservationScope {
-  /** The ref the caller passed as within. */
+  /** The ref the caller passed as within (v8 compatibility echo). */
   ref: string
+  /**
+   * v9: a ref minted in THIS observation for the root element. When the root
+   * was emitted, it equals that node's ref (the root is always nodes[0] of a
+   * scoped view); when the visibility gate excluded the root, the root is
+   * absent from nodes but rootRef still binds it, so a follow-up
+   * observe({ within: scope.rootRef }) keeps resolving while the root stays
+   * hidden.
+   */
+  rootRef: string
   role: string
   name: string
   tag: string
@@ -133,6 +157,18 @@ export interface BrowserSemanticNode {
    * TARGET_UNBINDABLE.
    */
   ref: string
+  /**
+   * v9: the ref of the nearest ANCESTOR — in the composed tree: light-DOM
+   * parents, through slot assignment to the slot's flattened parent, and
+   * crossing a shadow root to its host — that is itself an emitted node in
+   * the SAME observation; null when none (the first whole-page node and every
+   * scoped root have none). Because ancestors always precede their
+   * descendants in emission order, a node's parentRef always points at an
+   * EARLIER node of the same observation. Refs are re-minted per observation,
+   * so consumers must compare ancestry as a RELATIONSHIP (the parent's index
+   * within the same view), never as raw ref strings.
+   */
+  parentRef: string | null
   role: string
   name: string
   tag: string
@@ -214,6 +250,26 @@ export interface BrowserSemanticNode {
   valueTruncated?: true
 }
 
+/** v9: identity anchor for the element the driver last dispatched an action on. */
+export interface BrowserObservationAnchor {
+  /**
+   * The anchored element's fresh ref in THIS observation when it was emitted
+   * (identity binding, never a selector re-match); null when the visibility
+   * gate or a budget excluded it — connected/contained stay truthful either
+   * way.
+   */
+  ref: string | null
+  /** Whether the original acted element is still connected to the document. */
+  connected: boolean
+  /**
+   * Whether the acted element lies inside the within subtree (composed
+   * containment: parent/host/assignedSlot chain). Null for a whole-page
+   * observation (no within was given); false when it is connected elsewhere
+   * or no longer connected at all.
+   */
+  contained: boolean | null
+}
+
 export interface BrowserObservation {
   ownerId: string
   epoch: number
@@ -234,21 +290,48 @@ export interface BrowserObservation {
   scope: BrowserObservationScope | null
   nodes: BrowserSemanticNode[]
   /**
+   * v9: count of semantic-selector matches the visibility gate skipped
+   * (visibility:hidden, display:none, opacity:0, zero/no client rects) within
+   * the scanned range. A diagnostic of the observable-node projection, never
+   * a truncation reason.
+   */
+  hiddenMatches: number
+  /**
+   * v9: true whenever collection stopped early (scan window, node budget, or
+   * byte budget), i.e. hiddenMatches is a LOWER BOUND of the subtree's
+   * gate-skipped matches. False means every match in the scanned range was
+   * examined and the count is exact.
+   */
+  hiddenMatchesPartial: boolean
+  /**
+   * v9: present only when the observe requested anchorLastAction — in-page
+   * truth about the element the driver last dispatched an action on (the
+   * ORIGINAL handle, never a re-matched node).
+   */
+  anchor?: BrowserObservationAnchor
+  /**
    * True whenever a selector-matching element that would have been emitted was
    * not: matches beyond the 500-match scan window, nodes cut by the node/byte
-   * budgets, and iframe content (see truncationReasons).
+   * budgets, iframe content, and unresolved slot assignment (see
+   * truncationReasons).
    */
   truncated: boolean
   /**
    * Present when truncated is true; names every reason the view is partial.
    * Reasons: scan-window-exceeded, node-budget-exceeded,
    * byte-budget-exceeded, iframe-not-traversed (the projection is main-frame
-   * only; any iframe/frame element, same-origin included, sets truncated). In
-   * a scoped (within) observation every reason — the iframe marker included —
-   * is relative to the subtree: an iframe elsewhere on the page does not
-   * truncate the subtree view. v6's identity-binding-failed is retired: v7
-   * never drops a collected node because a handle could not be made — such a
-   * node stays with bindable:false instead.
+   * only; any iframe/frame element, same-origin included, sets truncated),
+   * slot-unresolved (v9: an element's slot assignment could not be resolved
+   * to a walkable render position — assignedElements threw or returned
+   * something unusable; the element is then not emitted, and the marker
+   * keeps the exclusion honest). Closed-shadow-root content remains outside
+   * this marker: it is invisible in-page and will be probed by the Phase C
+   * CDP coverage check.
+   * In a scoped (within) observation every reason — the iframe marker
+   * included — is relative to the subtree: an iframe elsewhere on the page
+   * does not truncate the subtree view. v6's identity-binding-failed is
+   * retired: v7 never drops a collected node because a handle could not be
+   * made — such a node stays with bindable:false instead.
    */
   truncationReasons?: string[]
   limits: {

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Phase B identity fixture</title>
+  <!--
+    Static page pinning contract v9 identity/ancestry behavior.
+    Whole-page matches (flattened-tree order, viewport 1280x800, controls are
+    240x24 blocks, body margin 0):
+      h1                                0
+      Phase B hidden root (region)      1   (visibility:hidden from 4000ms on)
+      hidden-child                      2   (inherits the hidden state)
+      Phase B anchor region (region)    3
+      anchor-button                     4
+      Phase B slot region (region)      5
+      shadow-button                     6   (open shadow root content)
+      slotted-late                      7   (light child, renders in the late slot)
+      slotted-early                     8   (light child, renders in the early slot)
+      before-slot-light                --   (unassigned light child: no flat-tree
+                                             render position, excluded from the
+                                             flattened walk entirely)
+      after-host                        9
+      Phase B closed region (region)   10
+      closed-slotted-button            11   (assigned to a slot inside a CLOSED
+                                             shadow root — assignment is
+                                             invisible in-page (assignedSlot is
+                                             null), so it stays at its light
+                                             position; Phase C probes such roots)
+      Phase B hidden matches region    12
+      hm-visible-0..2                  13..15
+      hm-hidden-0..1                   --   (display:none, counted by hiddenMatches)
+  -->
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    h1 { margin: 0; height: 40px; line-height: 40px; font-size: 24px; }
+    .box { display: block; width: 240px; height: 24px; margin: 0; padding: 0; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <h1>Phase B fixture</h1>
+  <div id="hidden-root" role="region" aria-label="Phase B hidden root">
+    <button class="box">hidden-child</button>
+  </div>
+  <div id="anchor-region" role="region" aria-label="Phase B anchor region">
+    <button class="box" id="anchor-button">anchor-button</button>
+  </div>
+  <div id="slot-region" role="region" aria-label="Phase B slot region">
+    <div id="card-host"></div>
+    <button class="box" id="after-host">after-host</button>
+  </div>
+  <div id="closed-region" role="region" aria-label="Phase B closed region">
+    <div id="closed-host"></div>
+  </div>
+  <div id="hidden-matches-region" role="region" aria-label="Phase B hidden matches region">
+    <button class="box">hm-visible-0</button>
+    <button class="box" style="display:none">hm-hidden-0</button>
+    <button class="box">hm-visible-1</button>
+    <button class="box" style="display:none">hm-hidden-1</button>
+    <button class="box">hm-visible-2</button>
+  </div>
+  <script>
+    // B4: slotted light-DOM children must be collected at their flattened
+    // render positions — inside the open shadow root's slots — and exactly
+    // once. The shadow tree lays out the LATE slot before the EARLY slot,
+    // while the light tree appends slotted-early first: the flattened order
+    // is shadow-button, slotted-late, slotted-early, after-host, and the
+    // light order (slotted-early before slotted-late) must NOT win.
+    // before-slot-light is unassigned: the flattened tree excludes it, so it
+    // is never emitted.
+    const cardHost = document.getElementById('card-host')
+    const cardRoot = cardHost.attachShadow({ mode: 'open' })
+    cardRoot.innerHTML = '<button id="shadow-button" style="display:block;width:240px;height:24px;margin:0;padding:0;box-sizing:border-box">shadow-button</button><div><slot name="late"></slot><slot name="early"></slot></div>'
+    const beforeSlot = document.createElement('button')
+    beforeSlot.className = 'box'
+    beforeSlot.textContent = 'before-slot-light'
+    cardHost.appendChild(beforeSlot)
+    const early = document.createElement('button')
+    early.className = 'box'
+    early.slot = 'early'
+    early.textContent = 'slotted-early'
+    cardHost.appendChild(early)
+    const late = document.createElement('button')
+    late.className = 'box'
+    late.slot = 'late'
+    late.textContent = 'slotted-late'
+    cardHost.appendChild(late)
+
+    // B4: assignment into a slot inside a CLOSED shadow root cannot be
+    // resolved to a walkable render position -> truncation reason
+    // slot-unresolved, and the element is not emitted (never silently).
+    const closedHost = document.getElementById('closed-host')
+    const closedRoot = closedHost.attachShadow({ mode: 'closed' })
+    closedRoot.innerHTML = '<slot></slot>'
+    const closedLight = document.createElement('button')
+    closedLight.className = 'box'
+    closedLight.textContent = 'closed-slotted-button'
+    closedHost.appendChild(closedLight)
+
+    // B2: after 4000ms the hidden-root region flips to visibility:hidden, so
+    // the visibility gate excludes it (and its child) from nodes while the
+    // scope root stays bound by its fresh rootRef.
+    setTimeout(() => {
+      document.getElementById('hidden-root').style.visibility = 'hidden'
+    }, 4000)
+  </script>
+</body>
+</html>

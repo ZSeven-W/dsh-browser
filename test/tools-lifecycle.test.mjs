@@ -32,6 +32,7 @@ function fakeDriver(events = []) {
         ownerId, epoch: 1, fingerprint: 'fingerprint', expiresAt: '2026-08-24T00:00:00.000Z',
         page: { ...page, viewport: { width: 1280, height: 800 } }, scope: null, nodes: [], truncated: false,
         limits: { maxNodes: 60, maxBytes: 49152 },
+        hiddenMatches: 0, hiddenMatchesPartial: false,
       }
     },
     async act(ownerId, action) {
@@ -56,7 +57,7 @@ function fakeDriver(events = []) {
 }
 
 test('raw tools use full JSON Schema, renderer ContentBlocks, and agent-owned identity', async () => {
-  assert.equal(BROWSER_DRIVER_CONTRACT_VERSION, 8)
+  assert.equal(BROWSER_DRIVER_CONTRACT_VERSION, 9)
   const events = []
   const tools = browserToolList(createBrowserTools(fakeDriver(events)))
   assert.deepEqual(tools.map((tool) => tool.name), BROWSER_TOOL_NAMES)

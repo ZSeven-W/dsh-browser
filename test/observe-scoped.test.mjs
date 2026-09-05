@@ -108,7 +108,8 @@ test('scoped observe reaches a deep target beyond the whole-page window and prov
     assert.ok(narrow.truncated, 'the narrow observation is partial: the subtree keeps 32 more nodes')
     assert.ok(narrow.truncationReasons?.includes('node-budget-exceeded'), JSON.stringify(narrow.truncationReasons))
     assert.ok(narrow.truncationReasons?.includes('iframe-not-traversed'), 'the iframe inside main must flag the main-scoped view: ' + JSON.stringify(narrow.truncationReasons))
-    assert.deepEqual(narrow.scope, { ref: narrow.scope.ref, role: 'region', name: 'Scope anchor region', tag: 'main' })
+    assert.deepEqual(narrow.scope, { ref: narrow.scope.ref, rootRef: narrow.nodes[0].ref, role: 'region', name: 'Scope anchor region', tag: 'main' })
+    assert.equal(narrow.nodes[0].name, 'Scope anchor region', 'the scoped root must be the first subtree node')
     assert.ok(!narrow.nodes.some((node) => node.name === 'Deep scoped target'), 'the deep target stays beyond the narrow budget')
 
     // Scope to the container: the whole subtree fits, truncated false with no
@@ -119,7 +120,7 @@ test('scoped observe reaches a deep target beyond the whole-page window and prov
     assert.equal(scoped.truncated, false, 'a subtree that fits must report truncated false')
     assert.equal(scoped.truncationReasons, undefined, 'no reasons when the subtree fits: ' + JSON.stringify(scoped.truncationReasons))
     assert.equal(scoped.limits.maxNodes, 40, 'limits.maxNodes keeps reporting the applied budget')
-    assert.deepEqual(scoped.scope, { ref: container.ref, role: 'region', name: 'Deep container', tag: 'div' })
+    assert.deepEqual(scoped.scope, { ref: container.ref, rootRef: scoped.nodes[0].ref, role: 'region', name: 'Deep container', tag: 'div' })
     assert.equal(scoped.nodes.length, 32, 'the container subtree holds 32 semantic matches')
     assert.ok(!scoped.nodes.some((node) => node.name.startsWith('probe-')), 'the scoped view must contain subtree nodes only')
     assert.ok(scoped.nodes.some((node) => node.name.startsWith('shadow-deep-')), 'open shadow roots must pierce inside the scope')

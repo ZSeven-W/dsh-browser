@@ -71,6 +71,7 @@ const sessionInfoSchema = closedObject({
 })
 const semanticNodeSchema = closedObject({
   ref: { type: 'string' },
+  parentRef: { oneOf: [{ type: 'string' }, { type: 'null' }] },
   role: { type: 'string' },
   name: { type: 'string' },
   tag: { type: 'string' },
@@ -83,9 +84,10 @@ const semanticNodeSchema = closedObject({
   value: { type: 'string' },
   valueWithheld: { type: 'boolean', const: true },
   valueTruncated: { type: 'boolean', const: true },
-}, ['ref', 'role', 'name', 'tag', 'interactive', 'editable', 'disabled', 'inViewport', 'bindable'])
+}, ['ref', 'parentRef', 'role', 'name', 'tag', 'interactive', 'editable', 'disabled', 'inViewport', 'bindable'])
 const observationScopeSchema = closedObject({
   ref: { type: 'string' },
+  rootRef: { type: 'string' },
   role: { type: 'string' },
   name: { type: 'string' },
   tag: { type: 'string' },
@@ -102,10 +104,17 @@ const observationSchema = closedObject({
   }),
   scope: { oneOf: [observationScopeSchema, { type: 'null' }] },
   nodes: { type: 'array', items: semanticNodeSchema },
+  hiddenMatches: { type: 'integer' },
+  hiddenMatchesPartial: { type: 'boolean' },
+  anchor: closedObject({
+    ref: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+    connected: { type: 'boolean' },
+    contained: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
+  }),
   truncated: { type: 'boolean' },
   truncationReasons: { type: 'array', items: { type: 'string' } },
   limits: closedObject({ maxNodes: { type: 'integer' }, maxBytes: { type: 'integer' } }),
-}, ['ownerId', 'epoch', 'fingerprint', 'expiresAt', 'page', 'scope', 'nodes', 'truncated', 'limits'])
+}, ['ownerId', 'epoch', 'fingerprint', 'expiresAt', 'page', 'scope', 'nodes', 'hiddenMatches', 'hiddenMatchesPartial', 'truncated', 'limits'])
 const actionReceiptSchema = closedObject({
   receiptId: { type: 'string' },
   ownerId: { type: 'string' },
@@ -199,15 +208,16 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
     presentCall: () => ({ card: 'generic', title: 'Start managed browser' }),
   })
 
-  const browserObserve = tool<{ max_nodes?: number; within?: string }, BrowserObservation>({
+  const browserObserve = tool<{ max_nodes?: number; within?: string; anchor_last_action?: true }, BrowserObservation>({
     name: 'browser_observe',
-    description: 'Return a bounded semantic view of the active page main frame only: iframe content is never included (its presence sets truncated), and hidden or zero-size elements are excluded. At most 500 selector matches are scanned; whenever a visible match could not be emitted - scan window, node or byte budget, or an iframe - truncated is true and truncationReasons names every cause, so an absent node is never silently read as absent from the page. A within ref (from the latest browser_observe) scopes the collection to that element\'s composed subtree instead of the whole page: maxNodes, the byte ceiling, the scan window, and the iframe marker all become subtree-relative, so a subtree that fits reports truncated:false and absence inside it is provable; unknown, expired, consumed, non-element, or detached within refs reject instead of falling back to the whole page. The result\'s scope echoes the root (null for a whole-page observe), while each node\'s inViewport keeps its whole-page viewport meaning. Editable controls carry a bounded value; secret-bearing fields (passwords, autocomplete secrets, CSS-masked fields) are marked valueWithheld and never exposed. Interactive nodes carry opaque refs tied to this Agent, page, observation epoch, fingerprint, and short expiry. Observe again after every dispatched action.',
+    description: 'Return a bounded semantic view of the active page main frame only: iframe content is never included (its presence sets truncated), and hidden or zero-size elements are excluded (hiddenMatches counts them; hiddenMatchesPartial marks the count a lower bound). At most 500 selector matches are scanned; whenever a visible match could not be emitted - scan window, node or byte budget, an iframe, or unresolved slot assignment - truncated is true and truncationReasons names every cause, so an absent node is never silently read as absent from the page. A within ref (from the latest browser_observe, including a scoped scope.rootRef) scopes the collection to that element\'s flattened subtree instead of the whole page: maxNodes, the byte ceiling, the scan window, and the iframe marker all become subtree-relative, so a subtree that fits reports truncated:false and absence inside it is provable; unknown, expired, consumed, non-element, or detached within refs reject instead of falling back to the whole page. Every node carries parentRef (the nearest emitted composed ancestor, null at the top), and the scope carries a fresh rootRef that keeps binding the root even when hidden. anchor_last_action verifies in-page, against the original acted handle, whether the last acted element is still connected and inside the within subtree (ANCHOR_UNAVAILABLE when none). Editable controls carry a bounded value; secret-bearing fields (passwords, autocomplete secrets, CSS-masked fields) are marked valueWithheld and never exposed. Interactive nodes carry opaque refs tied to this Agent, page, observation epoch, fingerprint, and short expiry. Observe again after every dispatched action.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         max_nodes: { type: 'integer', description: 'Maximum semantic nodes to return (1..100, default 60).' },
-        within: { type: 'string', description: 'Optional ref from the latest browser_observe: collect semantic nodes from the composed subtree rooted at that element (subtree-relative budgets, truncated:false when the subtree fits) instead of the whole page.' },
+        within: { type: 'string', description: 'Optional ref from the latest browser_observe (including scope.rootRef): collect semantic nodes from the flattened subtree rooted at that element (subtree-relative budgets, truncated:false when the subtree fits) instead of the whole page.' },
+        anchor_last_action: { type: 'boolean', const: true, description: 'Report an anchor for the element the driver last dispatched an action on: connected, contained in the within subtree, and its fresh ref; rejects ANCHOR_UNAVAILABLE when no action target is retained.' },
       },
     },
     output: outputFor(observationSchema),
@@ -217,6 +227,7 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
       return driver.observe(ownerFromExec(exec), {
         ...(args.max_nodes === undefined ? {} : { maxNodes: args.max_nodes }),
         ...(args.within === undefined ? {} : { within: args.within }),
+        ...(args.anchor_last_action === undefined ? {} : { anchorLastAction: args.anchor_last_action }),
       }, exec.signal)
     },
     presentCall: () => ({ card: 'generic', title: 'Observe browser semantics' }),

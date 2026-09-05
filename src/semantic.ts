@@ -17,6 +17,16 @@ export interface RawSemanticCandidate {
    * on the handle re-inspection path, which never re-binds by index.
    */
   matchIndex?: number
+  /**
+   * Position of the nearest ANCESTOR that is itself an emitted candidate in
+   * the same collection (an index into the candidates array), in composed-tree
+   * terms: light-DOM parents, through an assigned slot to the slot's flattened
+   * parent, and crossing a shadow root to its host. Null at the top of the
+   * view. Serialized from the single page-side evaluation; the manager turns
+   * it into the node's public parentRef. Never part of the identity
+   * fingerprint.
+   */
+  parentIndex?: number | null
   role: string
   name: string
   tag: string
@@ -43,13 +53,17 @@ export interface RawSemanticCandidate {
 
 export interface StoredSemanticTarget extends RawSemanticCandidate {
   ref: string
+  /** Public parentRef: the ref of the nearest emitted composed ancestor in the SAME observation, or null. Set by the manager. */
+  parentRef: string | null
   fingerprint: string
   /**
    * The Playwright element handle captured at observation time. A ref resolves
    * to THIS node and never to a selector re-match, so an identical twin sliding
    * into the stored selector path can never be substituted for the original.
+   * Undefined when the observation could not materialize a binding for the
+   * node (bindable:false).
    */
-  handle?: ElementHandle<Element>
+  handle: ElementHandle<Element> | undefined
 }
 
 const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' ').trim().slice(0, max)
@@ -94,6 +108,7 @@ export function observationFingerprint(url: string, title: string, targets: Stor
 export function publicSemanticNode(target: StoredSemanticTarget): BrowserSemanticNode {
   return {
     ref: target.ref,
+    parentRef: target.parentRef,
     role: target.role,
     name: target.name,
     tag: target.tag,
@@ -131,12 +146,22 @@ export interface SemanticCollectOptions {
   includeMatchIndex?: boolean
   /**
    * Optional live root element: when present, the projection is limited to
-   * the composed subtree rooted at this element (the element itself, its
-   * light-tree descendants, and every open shadow root inside), and the scan
-   * window, the node budget, and the iframe marker are all relative to that
-   * subtree. Omit for the whole-page projection.
+   * the flattened subtree rooted at this element (the element itself, its
+   * light-tree descendants, slotted children at their assigned-slot render
+   * position, and every open shadow root inside), and the scan window, the
+   * node budget, and the iframe marker are all relative to that subtree.
+   * Omit for the whole-page projection.
    */
   root?: ElementHandle<Element>
+  /**
+   * Optional identity anchor: the ORIGINAL handle of the element the driver
+   * last dispatched an action on (never a re-matched node). When present, the
+   * same evaluation measures — in-page — whether it is still connected,
+   * whether it lies inside the root subtree by composed containment (null
+   * when no root is given), and its index among the retained elements when it
+   * was emitted (else -1).
+   */
+  anchor?: ElementHandle<Element>
 }
 
 export interface SemanticCollectResult extends SemanticScanResult {
@@ -144,6 +169,32 @@ export interface SemanticCollectResult extends SemanticScanResult {
   handles: Array<ElementHandle<Element>>
   /** True when a visible candidate was dropped by the node budget. */
   nodeBudgetExceeded: boolean
+  /** Count of selector matches the visibility gate skipped inside the scanned range. */
+  hiddenMatches: number
+  /**
+   * True when slot assignment could not be resolved to a walkable render
+   * position somewhere in the traversed range (assignedElements threw or
+   * returned something unusable). The caller marks the view truncated with
+   * slot-unresolved. Assignment into a CLOSED shadow root is invisible
+   * in-page (assignedSlot is null there by spec) and is left to the Phase C
+   * CDP coverage probe.
+   */
+  slotUnresolved: boolean
+  /**
+   * Present only when root was provided: the root element's serialized
+   * candidate, computed ALWAYS — even when the visibility gate excluded the
+   * root from candidates — so the caller can mint a ref that still binds the
+   * root. rootEmittedIndex is its index among the candidates when it was
+   * emitted, else -1.
+   */
+  rootCandidate?: RawSemanticCandidate
+  rootEmittedIndex?: number
+  /** ElementHandle to the root element, materialized independently of the candidate handles. */
+  rootHandle?: ElementHandle<Element>
+  /** Present only when anchor was provided: in-page truth about the anchored element. */
+  anchorInfo?: { connected: boolean; contained: boolean | null } | null
+  /** Index of the anchored element among the retained elements, or -1 when it was not emitted. */
+  anchorIndex?: number
   /**
    * Present only when root was provided and the rooted collection was
    * refused: 'not-element' when the root is not an Element node, 'detached'
@@ -173,7 +224,7 @@ export interface SemanticCollectResult extends SemanticScanResult {
  * marked bindable:false by the caller — it is never silently dropped.
  */
 export async function collectSemanticTargets(page: Page, options: SemanticCollectOptions): Promise<SemanticCollectResult> {
-  const { scanLimit, maxNodes, includeMatchIndex = false, root } = options
+  const { scanLimit, maxNodes, includeMatchIndex = false, root, anchor } = options
   const capture = await page.evaluateHandle((args) => {
     const {
       selector,
@@ -181,6 +232,7 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       maxNodes: nodeBudget,
       includeMatchIndex: withMatchIndex,
       root: rootElement,
+      anchor: anchorElement,
     } = args
     const normalize = (value: string | null | undefined, max = 180): string => String(value ?? '')
       .replace(/\s+/gu, ' ')
@@ -307,74 +359,115 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       }
     }
     /**
-     * Piercing match collection in composed-tree order: light-tree document
-     * order, descending into every OPEN shadow root at its host's position —
-     * the same reach the locator engine had, executed in this synchronous
-     * evaluation so no later DOM mutation can invalidate the list. With a
-     * scope root the walk starts at that element (which is itself part of
-     * the subtree) instead of the document; iframe/frame elements are
-     * counted by the same walk so the subtree-relative truncation marker is
-     * atomically consistent with the collected candidates.
+     * Flattened-tree match collection: light-tree document order, descending
+     * into every OPEN shadow root at its host's position, and following slot
+     * assignment so a light-DOM child slotted into an open shadow root is
+     * collected at the slot position it RENDERS in — exactly once, never at
+     * its light-tree position too. A slot renders its
+     * assignedElements({flatten:true}) (the flatten flag resolves nested
+     * slots across shadow trees); with nothing assigned it renders its own
+     * fallback children. A light child of a shadow host that is assigned to
+     * NO slot has no flattened render position and is not collected. Where
+     * assignment cannot be resolved to a walkable position (assignedElements
+     * throws or returns something unusable) slotUnresolved is set so the
+     * caller can mark the view truncated instead of silently dropping
+     * content. Assignment into a CLOSED shadow root is invisible in-page
+     * (assignedSlot is null there by spec) and belongs to the Phase C CDP
+     * coverage probe. Executed in this one synchronous evaluation so no
+     * later DOM mutation can invalidate the list. With a scope root the walk
+     * starts at that element (which is itself part of the subtree);
+     * iframe/frame elements are counted by the same walk so the
+     * subtree-relative truncation marker is atomically consistent with the
+     * collected candidates.
      */
-    const collectMatches = (selector: string, from: Document | Element): { results: Element[]; iframeCount: number } => {
+    const collectMatches = (selector: string, from: Document | ShadowRoot | Element): { results: Element[]; iframeCount: number; slotUnresolved: boolean } => {
       const results: Element[] = []
       let iframeCount = 0
-      const visit = (rootNode: Document | ShadowRoot | Element): void => {
-        const documentNode = rootNode instanceof Document ? rootNode : rootNode.ownerDocument
-        if (documentNode === null) return
-        if (!(rootNode instanceof Document)) {
-          // A TreeWalker's nextNode() starts AFTER its root, so a non-document
-          // root must be processed explicitly: an element root is itself part
-          // of the subtree (and may match or pierce its own shadow root), a
-          // ShadowRoot root is not an Element and can never match.
-          if (rootNode instanceof Element) {
-            if (rootNode.matches(selector)) results.push(rootNode)
-            if (rootNode.tagName === 'IFRAME' || rootNode.tagName === 'FRAME') iframeCount += 1
-            if (rootNode.shadowRoot !== null) visit(rootNode.shadowRoot)
-          }
-        }
-        const walker = documentNode.createTreeWalker(rootNode, NodeFilter.SHOW_ELEMENT)
-        let node = walker.nextNode()
-        while (node !== null) {
-          const element = node as Element
-          if (element.matches(selector)) results.push(element)
-          if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') iframeCount += 1
-          if (element.shadowRoot !== null) visit(element.shadowRoot)
-          node = walker.nextNode()
+      let slotUnresolved = false
+      const resolveSlot = (slot: HTMLSlotElement): Element[] | null => {
+        try {
+          const assigned = slot.assignedElements({ flatten: true })
+          return Array.isArray(assigned) ? Array.from(assigned) : null
+        } catch {
+          return null
         }
       }
-      visit(from)
-      return { results, iframeCount }
+      // visitElement processes an element at its RENDER position. The flag
+      // marks entries that must not be skipped as slot-assigned: the scope
+      // root (processed wherever the caller rooted the scope) and elements
+      // reached THROUGH their assigned slot.
+      const visitElement = (element: Element, atRenderPosition: boolean): void => {
+        if (!atRenderPosition && element.assignedSlot !== null) {
+          // Rendered inside its assigned slot (open shadow root): reached
+          // from the slot's position, never re-emitted at the light position.
+          // Assignment into a CLOSED root is invisible in-page (assignedSlot
+          // is null there by spec); that exclusion belongs to the Phase C
+          // CDP coverage probe, not to this walk.
+          return
+        }
+        if (element.tagName === 'SLOT') {
+          // A slot renders its assigned elements (flattened across nested
+          // slots); with nothing assigned it renders its fallback children.
+          const assigned = resolveSlot(element as HTMLSlotElement)
+          if (assigned === null) {
+            slotUnresolved = true
+            return
+          }
+          if (assigned.length > 0) {
+            for (const node of assigned) {
+              if (node instanceof Element) visitElement(node, true)
+            }
+          } else {
+            visitChildren(element)
+          }
+          return
+        }
+        if (element.matches(selector)) results.push(element)
+        if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') iframeCount += 1
+        visitChildren(element.shadowRoot ?? element)
+      }
+      const visitChildren = (parentNode: Document | ShadowRoot | Element): void => {
+        for (let child = parentNode.firstElementChild; child !== null; child = child.nextElementSibling) {
+          visitElement(child, false)
+        }
+      }
+      if (from instanceof Document || from instanceof ShadowRoot) visitChildren(from)
+      else visitElement(from, true)
+      return { results, iframeCount, slotUnresolved }
     }
     // Fail closed on an unusable scope root BEFORE any collection: the caller
     // must be able to tell "the scope refused" apart from "the subtree is
     // empty", and must never receive a whole-page fallback.
     if (rootElement !== undefined) {
       if (rootElement.nodeType !== 1) {
-        return { output: [], totalMatches: 0, scanned: 0, nodeBudgetExceeded: false, selected: [], iframeCount: 0, rootFailure: 'not-element' }
+        return { output: [], totalMatches: 0, scanned: 0, nodeBudgetExceeded: false, selected: [], iframeCount: 0, hiddenMatches: 0, slotUnresolved: false, rootCandidate: null, rootEmittedIndex: -1, anchorConnected: undefined, anchorContained: undefined, anchorIndex: -1, rootFailure: 'not-element' }
       }
       if (!rootElement.isConnected) {
-        return { output: [], totalMatches: 0, scanned: 0, nodeBudgetExceeded: false, selected: [], iframeCount: 0, rootFailure: 'detached' }
+        return { output: [], totalMatches: 0, scanned: 0, nodeBudgetExceeded: false, selected: [], iframeCount: 0, hiddenMatches: 0, slotUnresolved: false, rootCandidate: null, rootEmittedIndex: -1, anchorConnected: undefined, anchorContained: undefined, anchorIndex: -1, rootFailure: 'detached' }
       }
     }
-    const { results: elements, iframeCount } = collectMatches(selector, rootElement ?? document)
-    const output: Array<Record<string, unknown>> = []
-    const selected: Element[] = []
-    const scanned = Math.min(elements.length, Number(limit))
-    let nodeBudgetExceeded = false
-    for (let matchIndex = 0; matchIndex < scanned; matchIndex += 1) {
-      const element = elements[matchIndex] as Element
+    const { results: elements, iframeCount, slotUnresolved } = collectMatches(selector, rootElement ?? document)
+    /**
+     * The composed-tree parent of a node: a slotted element's parent is its
+     * assigned slot (whose own composed chain runs through the shadow tree to
+     * the host), a shadow-root child's parent is the host, and everything
+     * else follows the light parent. Used for parentRef ancestry and for
+     * composed containment of the anchor.
+     */
+    const composedParentOf = (node: Element): Element | null => {
+      if (node.assignedSlot !== null) return node.assignedSlot
+      const parent = node.parentNode
+      if (parent instanceof ShadowRoot) return parent.host
+      return parent instanceof Element ? parent : null
+    }
+    /**
+     * Serialize one element into a candidate record WITHOUT the visibility
+     * gate. The gate is applied by the emission loop; the scope root uses
+     * this directly so a gate-excluded root still yields a bindable record
+     * for rootRef minting.
+     */
+    const serializeCandidate = (element: Element): Record<string, unknown> => {
       const html = element as HTMLElement
-      const style = getComputedStyle(element)
-      const rect = element.getBoundingClientRect()
-      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) continue
-      if (rect.width <= 0 || rect.height <= 0 || element.getClientRects().length === 0) continue
-      // The candidate at this position is visible and cannot be emitted: the
-      // node budget dropped it, exactly like the caller's emission loop.
-      if (selected.length >= nodeBudget) {
-        nodeBudgetExceeded = true
-        break
-      }
       const tag = element.tagName.toLowerCase()
       const inputType = tag === 'input' ? (element.getAttribute('type') ?? 'text').toLowerCase() : ''
       const role = normalize(element.getAttribute('role'), 60) || implicitRole(element)
@@ -387,26 +480,116 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       const interactive = editable || ['a', 'button', 'select', 'summary'].includes(tag)
         || element.hasAttribute('tabindex') || role !== 'generic' && role !== 'heading'
       const disabled = element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || nativeDisabled
+      const rect = element.getBoundingClientRect()
       const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
       const href = safeHref(element)
-      const candidate: Record<string, unknown> = {
+      return {
         selector: selectorFor(element), role, name: accessibleName(element), tag, inputType,
         interactive, editable, disabled, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
         ...observableValue(element, inputType),
-        ...(withMatchIndex ? { matchIndex } : {}),
       }
-      output.push(candidate)
+    }
+    const output: Array<Record<string, unknown>> = []
+    const selected: Element[] = []
+    /** Element -> its index in the emitted arrays, for parentRef ancestry. */
+    const emittedIndex = new Map<Element, number>()
+    const scanned = Math.min(elements.length, Number(limit))
+    let nodeBudgetExceeded = false
+    let hiddenMatches = 0
+    for (let matchIndex = 0; matchIndex < scanned; matchIndex += 1) {
+      const element = elements[matchIndex] as Element
+      const style = getComputedStyle(element)
+      const rect = element.getBoundingClientRect()
+      // The visibility gate: matches skipped here are counted (hiddenMatches),
+      // never emitted, and never consume the node budget.
+      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) {
+        hiddenMatches += 1
+        continue
+      }
+      if (rect.width <= 0 || rect.height <= 0 || element.getClientRects().length === 0) {
+        hiddenMatches += 1
+        continue
+      }
+      // The candidate at this position is visible and cannot be emitted: the
+      // node budget dropped it, exactly like the caller's emission loop.
+      if (selected.length >= nodeBudget) {
+        nodeBudgetExceeded = true
+        break
+      }
+      // parentRef ancestry: the nearest EMITTED node on this element's
+      // composed ancestor chain (light parents, assigned slot, shadow host).
+      let parentIndex: number | null = null
+      let cursor = composedParentOf(element)
+      while (cursor !== null) {
+        const emitted = emittedIndex.get(cursor)
+        if (emitted !== undefined) {
+          parentIndex = emitted
+          break
+        }
+        cursor = composedParentOf(cursor)
+      }
+      emittedIndex.set(element, output.length)
+      output.push({
+        ...serializeCandidate(element),
+        ...(withMatchIndex ? { matchIndex } : {}),
+        parentIndex,
+      })
       selected.push(element)
     }
+    // The scope root record is produced ALWAYS (the emitted record when the
+    // gate passed, a fresh serialization otherwise) so the caller can mint a
+    // rootRef that binds the root even when the gate excluded it from nodes.
+    let rootCandidate: Record<string, unknown> | null = null
+    let rootEmittedIndex = -1
+    if (rootElement !== undefined) {
+      const emitted = emittedIndex.get(rootElement)
+      if (emitted !== undefined) {
+        rootCandidate = output[emitted] as Record<string, unknown>
+        rootEmittedIndex = emitted
+      } else {
+        rootCandidate = serializeCandidate(rootElement)
+      }
+    }
+    // Anchor truth, measured against the ORIGINAL handled element in this
+    // same evaluation: connected, composed containment inside the scope root
+    // (null without a root), and its emission index when it was emitted.
+    let anchorConnected: boolean | null = null
+    let anchorContained: boolean | null = null
+    if (anchorElement !== undefined) {
+      anchorConnected = anchorElement.isConnected
+      if (rootElement !== undefined) {
+        anchorContained = false
+        let anchorCursor: Element | null = anchorElement
+        while (anchorCursor !== null) {
+          if (anchorCursor === rootElement) {
+            anchorContained = true
+            break
+          }
+          anchorCursor = composedParentOf(anchorCursor)
+        }
+      }
+    }
+    const anchorIndex = anchorElement === undefined ? -1 : selected.indexOf(anchorElement)
     // Selection, serialization, and retention happened in this same
     // synchronous evaluation, so no DOM mutation can separate them: the
     // retained array IS the serialized candidates, by construction. The byte
     // budget is applied by the caller on the real public nodes (whose bytes it
     // computes exactly), so nodes trimmed there simply lose their handle.
-    return { output, totalMatches: elements.length, scanned, nodeBudgetExceeded, selected, iframeCount }
-  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex, root })
+    return {
+      output,
+      totalMatches: elements.length,
+      scanned,
+      nodeBudgetExceeded,
+      selected,
+      iframeCount,
+      hiddenMatches,
+      slotUnresolved,
+      ...(rootElement === undefined ? {} : { rootCandidate, rootEmittedIndex, rootRetained: rootElement }),
+      ...(anchorElement === undefined ? {} : { anchorConnected, anchorContained, anchorIndex }),
+    }
+  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex, root, anchor })
 
   // Pull the serialized projection and the retained element array out of the
   // single capture handle, then materialize ElementHandles for ONLY those
@@ -417,30 +600,59 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     scanned: number
     nodeBudgetExceeded: boolean
     iframeCount: number
+    hiddenMatches: number
+    slotUnresolved: boolean
     rootFailure?: 'not-element' | 'detached'
+    rootCandidate?: Record<string, unknown> | null
+    rootEmittedIndex?: number
+    anchorConnected?: boolean
+    anchorContained?: boolean | null
+    anchorIndex?: number
   }
   let selectedHandle: JSHandle<Element[]>
+  let rootRetainedHandle: JSHandle<Element | undefined>
   try {
-    ;[raw, selectedHandle] = await Promise.all([
+    ;[raw, selectedHandle, rootRetainedHandle] = await Promise.all([
       capture.evaluate((value) => ({
         output: value.output,
         totalMatches: value.totalMatches,
         scanned: value.scanned,
         nodeBudgetExceeded: value.nodeBudgetExceeded === true,
         iframeCount: Number(value.iframeCount ?? 0),
+        hiddenMatches: Number(value.hiddenMatches ?? 0),
+        slotUnresolved: value.slotUnresolved === true,
         ...(value.rootFailure === 'not-element' || value.rootFailure === 'detached'
           ? { rootFailure: value.rootFailure as 'not-element' | 'detached' }
           : {}),
+        ...(value.rootCandidate === undefined || value.rootCandidate === null
+          ? {}
+          : { rootCandidate: value.rootCandidate as Record<string, unknown> }),
+        rootEmittedIndex: typeof value.rootEmittedIndex === 'number' ? Number(value.rootEmittedIndex) : -1,
+        ...(value.anchorConnected === undefined
+          ? {}
+          : {
+              anchorConnected: value.anchorConnected === true,
+              anchorContained: value.anchorContained === null ? null : value.anchorContained === true,
+            }),
+        anchorIndex: typeof value.anchorIndex === 'number' ? Number(value.anchorIndex) : -1,
       })),
       capture.getProperty('selected') as Promise<JSHandle<Element[]>>,
+      capture.getProperty('rootRetained') as Promise<JSHandle<Element | undefined>>,
     ])
   } finally {
     await capture.dispose().catch(() => {})
   }
+  let rootHandle: ElementHandle<Element> | undefined
+  {
+    const element = rootRetainedHandle.asElement()
+    if (element !== null) rootHandle = element
+    else await rootRetainedHandle.dispose().catch(() => {})
+  }
 
-  const candidates: RawSemanticCandidate[] = raw.output.map((value) => ({
+  const mapCandidate = (value: Record<string, unknown>): RawSemanticCandidate => ({
     selector: String(value.selector),
     ...(typeof value.matchIndex === 'number' ? { matchIndex: Number(value.matchIndex) } : {}),
+    parentIndex: typeof value.parentIndex === 'number' ? Number(value.parentIndex) : null,
     role: compact(String(value.role || 'generic'), 60),
     name: compact(String(value.name || ''), 180),
     tag: compact(String(value.tag || ''), 30),
@@ -459,7 +671,9 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
             ...(value.valueTruncated === true ? { valueTruncated: true as const } : {}),
           }
         : {}),
-  }))
+  })
+  const candidates: RawSemanticCandidate[] = raw.output.map(mapCandidate)
+  const rootCandidate: RawSemanticCandidate | undefined = raw.rootCandidate === undefined || raw.rootCandidate === null ? undefined : mapCandidate(raw.rootCandidate)
   // The array is exactly the serialized candidates, so the handles are the
   // serialized elements by construction — no index re-verification.
   let handles: Array<ElementHandle<Element>> = []
@@ -487,8 +701,19 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     totalMatches: Number(raw.totalMatches),
     scanned: Number(raw.scanned),
     nodeBudgetExceeded: raw.nodeBudgetExceeded,
+    hiddenMatches: Number(raw.hiddenMatches ?? 0),
+    slotUnresolved: raw.slotUnresolved,
     ...(raw.rootFailure === undefined ? {} : { rootFailure: raw.rootFailure }),
     iframeCount: raw.iframeCount,
+    ...(rootCandidate === undefined
+      ? {}
+      : { rootCandidate, rootEmittedIndex: Number(raw.rootEmittedIndex ?? -1), ...(rootHandle === undefined ? {} : { rootHandle }) }),
+    ...(raw.anchorConnected === undefined
+      ? {}
+      : {
+          anchorInfo: { connected: raw.anchorConnected, contained: raw.anchorContained ?? null },
+          anchorIndex: Number(raw.anchorIndex ?? -1),
+        }),
   }
 }
 

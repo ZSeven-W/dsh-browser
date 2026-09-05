@@ -12,9 +12,12 @@ import { BrowserManager, discoverInstalledBrowser } from '../lib/index.js'
 // Nodes are emitted in composed-tree DOM order (open shadow roots pierced at
 // their host's position), display:none/visibility:hidden/zero-box candidates
 // are skipped before they can consume the budget, truncation keeps the first
-// N, and every per-node field other than `ref` — inViewport included — is
-// identical between the two observations over the shared prefix. `ref` is the
-// one field that MUST differ: refs are re-minted per observation.
+// N, and every per-node field other than `ref` and `parentRef` — inViewport
+// included — is identical between the two observations over the shared
+// prefix. `ref` and `parentRef` are the fields that MUST differ as raw
+// strings: both are re-minted per observation. v9 compares `parentRef` as a
+// RELATIONSHIP instead — the parent's index within the same view, or null —
+// which must be identical across budgets for the shared prefix.
 // The fixture is static, so any prefix violation here is a deterministic
 // driver counterexample, not a churn artifact.
 
@@ -36,16 +39,44 @@ const scopedFixtureHtml = await readFile(
   'utf8',
 )
 
-// Every public node field except the observation-specific `ref`.
+// Every public node field except the observation-specific `ref` and
+// `parentRef` (both re-minted per observation; parentRef is pinned as a
+// relationship below).
 const nodeFields = (node) => {
-  const { ref, ...fields } = node
+  const { ref, parentRef, ...fields } = node
   return fields
 }
 
-// ...except `ref` AND `inViewport` (the only field a scroll may change).
+// ...except `ref`, `parentRef`, AND `inViewport` (the only field a scroll
+// may change).
 const nodeFieldsStable = (node) => {
-  const { ref, inViewport, ...fields } = node
+  const { ref, parentRef, inViewport, ...fields } = node
   return fields
+}
+
+// v9: parentRef is pinned as a RELATIONSHIP — the parent's INDEX within the
+// same view, or null — never as a raw ref string, because refs are re-minted
+// per observation.
+const parentIndexOf = (view, node) => {
+  if (!('parentRef' in node)) return 'missing'
+  if (node.parentRef === null) return null
+  return view.nodes.findIndex((candidate) => candidate.ref === node.parentRef)
+}
+
+const assertParentRelationship = (small, large, label) => {
+  for (let i = 0; i < small.nodes.length; i += 1) {
+    const smallParent = parentIndexOf(small, small.nodes[i])
+    const largeParent = parentIndexOf(large, large.nodes[i])
+    assert.notEqual(smallParent, 'missing', label + ': index ' + i + ' must carry parentRef')
+    assert.notEqual(largeParent, 'missing', label + ': index ' + i + ' must carry parentRef')
+    assert.notEqual(smallParent, -1, label + ': index ' + i + ' parentRef must resolve inside the small view')
+    assert.notEqual(largeParent, -1, label + ': index ' + i + ' parentRef must resolve inside the large view')
+    assert.equal(
+      smallParent,
+      largeParent,
+      label + ': index ' + i + ' parentRef relationship must be identical across the two views: small-parent=' + smallParent + ' large-parent=' + largeParent,
+    )
+  }
 }
 
 const differingFields = (a, b) => {
@@ -115,7 +146,11 @@ test('observe on an unchanged page: smaller maxNodes lists are field-level prefi
           label + ': index ' + i + ' differs in fields [' + diffs.join(', ') + ']: small=' + JSON.stringify(a) + ' large=' + JSON.stringify(b),
         )
         assert.notEqual(a.ref, b.ref, label + ': index ' + i + ' refs must be re-minted per observation')
+        if (a.parentRef !== null || b.parentRef !== null) {
+          assert.notEqual(a.parentRef, b.parentRef, label + ': index ' + i + ' parentRef raw strings must be re-minted per observation')
+        }
       }
+      assertParentRelationship(small, large, label)
     }
 
     // Same page state, three budgets: each smaller list must be a strict
@@ -167,6 +202,7 @@ test('observe on an unchanged page: smaller maxNodes lists are field-level prefi
       assert.equal(diffs.length, 0, 'clamped 500 vs explicit 100: index ' + i + ' differs in fields [' + diffs.join(', ') + ']')
       assert.notEqual(pre500.nodes[i].ref, pre100.nodes[i].ref, 'clamped 500 vs explicit 100: refs must be re-minted per observation')
     }
+    assertParentRelationship(pre100, pre500, 'clamped 500 vs explicit 100')
 
     // Scroll the viewport one page down. The DOM is untouched; only which
     // nodes intersect the viewport changes.
@@ -199,6 +235,7 @@ test('observe on an unchanged page: smaller maxNodes lists are field-level prefi
         assert.notEqual(pre.nodes[i].ref, post.nodes[i].ref, label + ': index ' + i + ' refs must be re-minted per observation')
         if (pre.nodes[i].inViewport !== post.nodes[i].inViewport) viewportFlips += 1
       }
+      assertParentRelationship(pre, post, label + '-node scroll pair')
     }
     assert.ok(viewportFlips > 0, 'the scroll must flip inViewport for at least one node')
   } finally {
@@ -297,11 +334,13 @@ test('scoped observe on an unchanged page: the prefix property holds within a fi
 
     // Both scope echoes describe the same container, with their own ref.
     assert.deepEqual(
-      { ...scopedSmall.scope, ref: undefined },
-      { ref: undefined, role: 'region', name: 'Deep container', tag: 'div' },
+      { ...scopedSmall.scope, ref: undefined, rootRef: undefined },
+      { ref: undefined, rootRef: undefined, role: 'region', name: 'Deep container', tag: 'div' },
       'scoped observe(5) scope echo',
     )
-    assert.deepEqual(scopedLarge.scope, { ref: largeContainer.ref, role: 'region', name: 'Deep container', tag: 'div' })
+    assert.equal(typeof scopedSmall.scope.rootRef, 'string', 'scoped observe(5) must mint a fresh rootRef')
+    assert.equal(scopedSmall.scope.rootRef, scopedSmall.nodes[0].ref, 'rootRef is the root node fresh ref in a scoped view')
+    assert.deepEqual(scopedLarge.scope, { ref: largeContainer.ref, rootRef: scopedLarge.nodes[0].ref, role: 'region', name: 'Deep container', tag: 'div' })
 
     // The deep target sits at subtree index 3, inside the 5-node prefix.
     assert.equal(scopedSmall.nodes[3].name, 'Deep scoped target', 'deep target in the small prefix')
@@ -319,6 +358,7 @@ test('scoped observe on an unchanged page: the prefix property holds within a fi
       )
       assert.notEqual(scopedSmall.nodes[i].ref, scopedLarge.nodes[i].ref, 'scoped prefix index ' + i + ' refs must be re-minted per observation')
     }
+    assertParentRelationship(scopedSmall, scopedLarge, 'scoped prefix')
   } finally {
     await manager.dispose().catch(() => {})
     server.closeAllConnections?.()
