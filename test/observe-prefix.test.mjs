@@ -204,3 +204,42 @@ test('observe on an unchanged page: smaller maxNodes lists are field-level prefi
   }
 })
 
+test('a 500-node request stays clamped to the 100-node ceiling while the benchmark escape hatch is unset', { timeout: 120_000 }, async (t) => {
+  try { await discoverInstalledBrowser() } catch (error) {
+    t.skip('installed Chrome/Edge/Chromium unavailable: ' + error.message)
+    return
+  }
+  // DSH_BROWSER_BENCH_MAX_NODES is the benchmark-only escape hatch
+  // (scripts/bench-observe.mjs). With the variable unset — every production
+  // and QA run — a 500-node request must clamp to the documented 100-node
+  // ceiling exactly as the shipped default.
+  const savedBenchMax = process.env.DSH_BROWSER_BENCH_MAX_NODES
+  delete process.env.DSH_BROWSER_BENCH_MAX_NODES
+  let port = 0
+  const server = createServer((req, res) => {
+    const requestUrl = new URL(req.url, 'http://127.0.0.1:' + port)
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    if (requestUrl.pathname === '/prefix') return res.end(fixtureHtml)
+    res.end('<h1>index</h1>')
+  })
+  port = await listen(server)
+  const origin = 'http://127.0.0.1:' + port
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-browser-ceiling-'))
+  const manager = new BrowserManager({ rootDir, allowedOrigins: [origin], observationTtlMs: 120_000 })
+  try {
+    await manager.start('owner', { url: origin + '/prefix' })
+    const observed = await manager.observe('owner', { maxNodes: 500 })
+    assert.equal(observed.limits.maxNodes, 100, 'a 500-node request must clamp to the 100-node ceiling when DSH_BROWSER_BENCH_MAX_NODES is unset')
+    assert.equal(observed.nodes.length, 100, 'the clamped request must emit exactly 100 nodes')
+    assert.equal(observed.truncated, true, 'the clamped request must still flag truncation')
+    assert.ok(observed.truncationReasons?.includes('node-budget-exceeded'), JSON.stringify(observed.truncationReasons))
+  } finally {
+    if (savedBenchMax === undefined) delete process.env.DSH_BROWSER_BENCH_MAX_NODES
+    else process.env.DSH_BROWSER_BENCH_MAX_NODES = savedBenchMax
+    await manager.dispose().catch(() => {})
+    server.closeAllConnections?.()
+    await new Promise((resolve) => server.close(resolve))
+    await rm(rootDir, { recursive: true, force: true }).catch(() => {})
+  }
+})
+

@@ -462,10 +462,23 @@ export class BrowserManager implements ZSevenBrowserDriver {
     }
   }
 
+  /**
+   * The observe() clamp ceiling. BENCHMARK-ONLY ESCAPE HATCH: the shipped,
+   * documented ceiling is 100 nodes per observation. DSH_BROWSER_BENCH_MAX_NODES
+   * exists solely so scripts/bench-observe.mjs can measure per-poll latency at
+   * larger node budgets WITHOUT shipping a behavior change; it is undocumented,
+   * not part of the driver contract, and when unset every request clamps to 100.
+   */
+  #observeMaxNodeCeiling(): number {
+    const bench = process.env.DSH_BROWSER_BENCH_MAX_NODES
+    if (bench === undefined || bench.trim() === '') return 100
+    return clampInt(Number(bench), 100, 1, 100_000)
+  }
+
   async observe(ownerId: string, options: BrowserObservationOptions = {}, signal?: AbortSignal): Promise<BrowserObservation> {
     const owner = validateOwner(ownerId)
     return this.#exclusive(owner, signal, async (session) => {
-      const maxNodes = clampInt(options.maxNodes, 60, 1, 100)
+      const maxNodes = clampInt(options.maxNodes, 60, 1, this.#observeMaxNodeCeiling())
       // Atomic capture: ONE page-side evaluation serializes the candidates AND
       // retains references to exactly the selected elements; ElementHandles for
       // only those elements are then materialized in one round trip. Handles are
