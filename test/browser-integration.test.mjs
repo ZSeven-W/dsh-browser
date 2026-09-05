@@ -29,6 +29,7 @@ test('real managed browser isolates agents, re-resolves refs, rejects risk, boun
   const outsidePort = await listen(outsideServer)
   const outsideOrigin = `http://127.0.0.1:${outsidePort}`
   const effects = { click: 0, fill: 0, press: 0 }
+  const mutation = { fired: false, applied: 0 }
   let port = 0
   const server = createServer((req, res) => {
     const requestUrl = new URL(req.url, `http://127.0.0.1:${port}`)
@@ -45,6 +46,23 @@ test('real managed browser isolates agents, re-resolves refs, rejects risk, boun
     if (requestUrl.pathname === '/effect') {
       const kind = requestUrl.searchParams.get('kind')
       if (kind && Object.hasOwn(effects, kind)) effects[kind] += 1
+      res.writeHead(204)
+      res.end()
+      return
+    }
+    if (requestUrl.pathname === '/mutate/fire') {
+      mutation.fired = true
+      res.writeHead(204)
+      res.end()
+      return
+    }
+    if (requestUrl.pathname === '/mutate-state') {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end(mutation.fired ? 'fire' : 'wait')
+      return
+    }
+    if (requestUrl.pathname === '/mutate-applied') {
+      mutation.applied += 1
       res.writeHead(204)
       res.end()
       return
@@ -75,7 +93,22 @@ test('real managed browser isolates agents, re-resolves refs, rejects risk, boun
       <div role="status">idle</div>
       <script>
         fetch('/api?token=secret').catch(() => {});
-        ${mutate ? "setTimeout(() => { document.querySelector('#mutable').textContent = 'After mutation' }, 80)" : ''}
+        ${mutate ? `(() => {
+          const poll = async () => {
+            let fire = false
+            try {
+              const state = await fetch('/mutate-state')
+              fire = (await state.text()) === 'fire'
+            } catch { /* retry on the next tick */ }
+            if (fire) {
+              document.querySelector('#mutable').textContent = 'After mutation'
+              fetch('/mutate-applied', { method: 'POST' }).catch(() => {})
+            } else {
+              setTimeout(poll, 10)
+            }
+          }
+          poll()
+        })()` : ''}
         ${swapKind ? `(() => {
           const original = document.elementFromPoint.bind(document);
           let swapped = false;
@@ -171,7 +204,12 @@ test('real managed browser isolates agents, re-resolves refs, rejects risk, boun
     const mutationObservation = await manager.observe('alpha')
     const mutable = mutationObservation.nodes.find((node) => node.name === 'Before mutation')
     assert.ok(mutable)
-    await new Promise((resolve) => setTimeout(resolve, 150))
+    await fetch(`${origin}/mutate/fire`)
+    const mutationDeadline = Date.now() + 10_000
+    while (mutation.applied === 0 && Date.now() < mutationDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.ok(mutation.applied > 0, 'fixture never applied the /mutate text change')
     const changed = await manager.act('alpha', { kind: 'click', ref: mutable.ref })
     assert.equal(changed.status, 'rejected')
     assert.equal(changed.code, 'TARGET_CHANGED')
