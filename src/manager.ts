@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -134,6 +135,15 @@ class ForcedCloseError extends Error {
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback
   return Math.max(min, Math.min(max, Math.trunc(value)))
+}
+
+function execFileAsync(file: string, args: string[], options: { maxBuffer: number }): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, options, (error, stdout) => {
+      if (error) reject(error)
+      else resolve(String(stdout))
+    })
+  })
 }
 
 function iso(ms: number): string {
@@ -1446,6 +1456,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
       await this.#closeContextBounded(session)
       session.closing = false
     }
+    await this.#sweepSessionProcesses(session)
     await this.#removeSessionDir(session)
   }
 
@@ -1472,11 +1483,66 @@ export class BrowserManager implements ZSevenBrowserDriver {
   async #forceKillBrowser(session: ManagedSession): Promise<void> {
     const pid = session.browserPid
     if (pid === undefined) return
+    // Killing only the browser main process leaves Chrome's out-of-process
+    // services (network, crashpad, utility) running: they keep flushing
+    // profile databases for seconds afterwards and can recreate the session
+    // directory after this manager already verified its removal. Reap every
+    // process that still carries this session's profile before polling the
+    // main pid's exit (see #sweepSessionProcesses).
+    await this.#sweepSessionProcesses(session)
     try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
     const deadline = Date.now() + FORCED_KILL_EXIT_POLL_MS
     while (Date.now() < deadline) {
       try { process.kill(pid, 0) } catch { break }
       await delay(100)
+    }
+  }
+
+  /**
+   * Kill every live process that references this session's profile directory.
+   * Playwright launches Chrome with the session directory on the command line
+   * of every helper process (renderers, network service, crashpad handler),
+   * so the --user-data-dir token identifies the whole process set even after
+   * the main process is gone and the survivors have been reparented. Without
+   * this sweep a force-killed (or briefly lingering) helper can recreate
+   * profile files after the removal gate below verified the directory absent,
+   * leaking session directories past dispose() (QA-BL-048).
+   */
+  async #sweepSessionProcesses(session: ManagedSession): Promise<void> {
+    if (process.platform === 'win32') {
+      // Playwright binds the browser to a Windows job object, so the process
+      // tree dies with the main process; nothing to sweep.
+      if (session.browserPid === undefined) return
+      await execFileAsync('taskkill', ['/pid', String(session.browserPid), '/T', '/F'], { maxBuffer: 1024 * 1024 }).catch(() => {})
+      return
+    }
+    // The leading dashes are written as [-][-] so pgrep never parses the token
+    // as an option; the exact --user-data-dir flag is what identifies every
+    // process belonging to THIS session's profile.
+    const token = `--user-data-dir=${session.userDataDir}`
+    const pattern = `[-][-]user-data-dir=${session.userDataDir}`
+    const pids = new Set<number>()
+    try {
+      const stdout = await execFileAsync('pgrep', ['-f', pattern], { maxBuffer: 16 * 1024 * 1024 })
+      for (const line of stdout.split('\n')) {
+        const candidate = Number(line.trim())
+        if (Number.isSafeInteger(candidate) && candidate > 1) pids.add(candidate)
+      }
+    } catch {
+      // pgrep unavailable: fall back to a ps command-line scan.
+      try {
+        const stdout = await execFileAsync('ps', ['-axo', 'pid=,command='], { maxBuffer: 16 * 1024 * 1024 })
+        for (const line of stdout.split('\n')) {
+          const match = /^\s*(\d+)\s+(.*)$/u.exec(line)
+          if (match === null || match[1] === undefined || match[2] === undefined) continue
+          const candidate = Number(match[1])
+          if (!Number.isSafeInteger(candidate) || candidate <= 1) continue
+          if (match[2].includes(token)) pids.add(candidate)
+        }
+      } catch { /* no process enumeration available: the main-pid kill remains */ }
+    }
+    for (const candidate of pids) {
+      try { process.kill(candidate, 'SIGKILL') } catch { /* already gone */ }
     }
   }
 
@@ -1497,14 +1563,27 @@ export class BrowserManager implements ZSevenBrowserDriver {
             maxRetries: 3,
             retryDelay: 50,
           })
-          await delay(25 * (attempt + 1))
-          try {
-            await access(session.userDataDir)
-            lastError = new Error('browser profile directory reappeared after removal')
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-            lastError = error
+          // Removal only counts once the directory STAYS absent across a short
+          // confirmation window. A single ENOENT check can pass while a Chrome
+          // helper is still flushing profile databases, which then recreates
+          // the directory after dispose() has already returned (QA-BL-048).
+          let stable = true
+          for (let check = 0; check < 2; check += 1) {
+            await delay(150 + 100 * check + 50 * attempt)
+            try {
+              await access(session.userDataDir)
+              stable = false
+              lastError = new Error('browser profile directory reappeared after removal')
+              break
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                stable = false
+                lastError = error
+                break
+              }
+            }
           }
+          if (stable) return
         } catch (error) {
           lastError = error
         }
