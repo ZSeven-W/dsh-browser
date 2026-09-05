@@ -53,6 +53,15 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 
 `observe({ anchorLastAction: true })` 返回驱动最后一次派发动作所作用元素的身份锚点 —— 派发时使用的原始 handle，绝不经重新匹配。驱动按会话保留该 handle（每次已派发动作都会替换；无元素目标的动作会清除；导航/dispose 时释放），并在页面内校验该元素是否仍处于连接状态、是否位于 `within` 子树内（composed containment：parent/host/assignedSlot 链）。`anchor: { ref, connected, contained }` —— 元素在本次观察中被输出时 `ref` 是其新 ref（被门控或预算排除时为 `null`，此时 `connected`/`contained` 依然真实），整页观察时 `contained` 为 `null`。没有保留的动作目标时，调用以 `ANCHOR_UNAVAILABLE` 拒绝 —— 绝不静默返回 null。
 
+## 已验证边界（v9, Phase C）
+
+`observe({ verifyCoverage: true })` 在收集完成后，对观察子树（`within` 根节点的子树；整页观察时为整个文档）运行一次**有界** CDP 探针，检测**所有**元素后代中的 CLOSED shadow root —— 包括非语义 host。closed root 在页面内不可见（`Element.shadowRoot` 为 null），因此即使 light tree 看起来完整，closed root 渲染的内容也缺失于投影。探针遍历 CDP DOM 树（`DOM.getDocument`/`DOM.describeNode`，depth -1 且 `pierce:true`；open root 被穿透，closed root 在其 host 上被检出，内嵌 frame 文档同样遍历），硬性上限为 5,000 个 DOM 节点和 250 ms，且每个受管会话复用一个惰性创建的 CDP session。每次观察都携带 `coverage: { verified, closedShadowRoots, probedNodes, reason? }`：
+
+- `closedShadowRoots > 0` → 截断原因 `closed-shadow-root`，`truncated: true`（内容缺失于投影）。
+- 探针未能完整跑完 —— `over-budget`（节点或时间上限）、`cdp-unavailable`（会话创建失败）、`root-unresolved`（within handle 无法映射到 CDP 后端节点）或 `error` → `verified: false` 并携带对应 `reason`，同时给出截断原因 `shadow-coverage-unverified`。被跳过、失败或超预算的探针一律如实报告自身原因 —— 绝不当作已验证。
+- 探针完整跑完且未发现任何 closed root → `verified: true`。只有此时，消费方才可以把 `truncated: false` 解读为“子树的每个语义节点都在投影中”：使用 `verifyCoverage` 时，`coverage.verified:true` 意味着观察子树中不存在 closed shadow root；投影由可观察语义节点构成（light tree + open root + flattened slot + 被跟踪的 closed root：无 —— closed root 只被检出、从不被穿透）。
+- 不使用 `verifyCoverage` 时，观察携带 `coverage: { verified: false, reason: 'skipped', closedShadowRoots: 0, probedNodes: 0 }`，且**不**增加任何截断原因：普通轮询在成本与 `truncated` 语义上完全不变。`verifyCoverage` 只用于终态“不存在”证明路径，绝不在 settle 轮询中使用。
+
 ## Operator 导航白名单
 
 > **重要：** `allowedOrigins` 默认不限制顶层 HTTP(S) 导航。用于生产或 QA 时，应由 Operator 配置精确白名单；模型不能修改或传入这个配置。
@@ -105,7 +114,7 @@ import {
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-服务会声明 `kind: "browser"` 和 `contractVersion: 9`（v9：每个节点都带 `parentRef` —— 最近被输出的 composed 祖先；限定 `scope` 携带新的 `rootRef`，即使根被门控排除仍保持绑定；`observe({ anchorLastAction: true })` 返回最后动作元素的身份锚点，否则以 `ANCHOR_UNAVAILABLE` 拒绝；遍历遵循 flattened slot 指派，无法解析时标记 `slot-unresolved`；观察报告 `hiddenMatches`/`hiddenMatchesPartial`。v8：`observe` 支持可选的 `within` ref，将投影限定到某个元素的子树并使用子树相对预算，每次观察都会报告 `scope`；v7 新增了 `bindable` 节点标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
+服务会声明 `kind: "browser"` 和 `contractVersion: 9`（v9：每个节点都带 `parentRef` —— 最近被输出的 composed 祖先；限定 `scope` 携带新的 `rootRef`，即使根被门控排除仍保持绑定；`observe({ anchorLastAction: true })` 返回最后动作元素的身份锚点，否则以 `ANCHOR_UNAVAILABLE` 拒绝；遍历遵循 flattened slot 指派，无法解析时标记 `slot-unresolved`；观察报告 `hiddenMatches`/`hiddenMatchesPartial`；Phase C 新增 `observe({ verifyCoverage: true })` —— 有界 CDP closed-shadow-root 探针，其每次观察的 `coverage` 证据是把 `truncated:false` 解读为完整投影的唯一依据。v8：`observe` 支持可选的 `within` ref，将投影限定到某个元素的子树并使用子树相对预算，每次观察都会报告 `scope`；v7 新增了 `bindable` 节点标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
 
 ## 已验证范围与限制
 
@@ -114,7 +123,7 @@ import {
 当前明确限制：
 
 - 仅支持 Chromium 系浏览器，未实现 Firefox / WebKit。
-- 当前是主文档语义 DOM 投影。所有 `<iframe>` / `<frame>` 内容（包括同源）暂不在范围内：观察会设置 `truncated` 并给出原因 `iframe-not-traversed`。closed shadow root 探测尚未实现（Phase C：将通过有界 CDP 覆盖探针以 `closed-shadow-root` 标记此类根）；在此之前，closed root 渲染的内容 —— 包括指派进其中 slot 的元素 —— 对投影不可见，投影只覆盖可观察语义节点（见 v9 一节）。
+- 当前是主文档语义 DOM 投影。所有 `<iframe>` / `<frame>` 内容（包括同源）暂不在范围内：观察会设置 `truncated` 并给出原因 `iframe-not-traversed`。closed shadow root 渲染的内容 —— 包括指派进其中 slot 的元素 —— 只被检出、从不被穿透：使用 `verifyCoverage` 时，有界 CDP 探针以 `closed-shadow-root` 标记此类根（见“已验证边界”一节）；不使用它时，投影只覆盖可观察语义节点，且不对 closed root 作任何断言。
 - `visualObserve` 只做捕获（像素 + Set-of-Mark 标签）；视觉理解由 DSH Harness 的视觉模型完成。
 - 驱动不会接管现有浏览器 Profile、浏览器扩展或已登录 Tab。登录态只能通过显式授权的 `storageState` 选项预加载（见导航策略一节）；注入的 Cookie 按 host 作用域发送，会到达该 host 的所有端口与协议。
 - 已验收路径是 Headless；Headful 参数存在，但尚未获得同等集成覆盖。

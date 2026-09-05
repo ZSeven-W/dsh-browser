@@ -111,10 +111,16 @@ const observationSchema = closedObject({
     connected: { type: 'boolean' },
     contained: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
   }),
+  coverage: closedObject({
+    verified: { type: 'boolean' },
+    closedShadowRoots: { type: 'integer' },
+    probedNodes: { type: 'integer' },
+    reason: { type: 'string', enum: ['skipped', 'over-budget', 'cdp-unavailable', 'root-unresolved', 'error'] },
+  }, ['verified', 'closedShadowRoots', 'probedNodes']),
   truncated: { type: 'boolean' },
   truncationReasons: { type: 'array', items: { type: 'string' } },
   limits: closedObject({ maxNodes: { type: 'integer' }, maxBytes: { type: 'integer' } }),
-}, ['ownerId', 'epoch', 'fingerprint', 'expiresAt', 'page', 'scope', 'nodes', 'hiddenMatches', 'hiddenMatchesPartial', 'truncated', 'limits'])
+}, ['ownerId', 'epoch', 'fingerprint', 'expiresAt', 'page', 'scope', 'nodes', 'hiddenMatches', 'hiddenMatchesPartial', 'coverage', 'truncated', 'limits'])
 const actionReceiptSchema = closedObject({
   receiptId: { type: 'string' },
   ownerId: { type: 'string' },
@@ -208,9 +214,9 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
     presentCall: () => ({ card: 'generic', title: 'Start managed browser' }),
   })
 
-  const browserObserve = tool<{ max_nodes?: number; within?: string; anchor_last_action?: true }, BrowserObservation>({
+  const browserObserve = tool<{ max_nodes?: number; within?: string; anchor_last_action?: true; verify_coverage?: true }, BrowserObservation>({
     name: 'browser_observe',
-    description: 'Return a bounded semantic view of the active page main frame only: iframe content is never included (its presence sets truncated), and hidden or zero-size elements are excluded (hiddenMatches counts them; hiddenMatchesPartial marks the count a lower bound). At most 500 selector matches are scanned; whenever a visible match could not be emitted - scan window, node or byte budget, an iframe, or unresolved slot assignment - truncated is true and truncationReasons names every cause, so an absent node is never silently read as absent from the page. A within ref (from the latest browser_observe, including a scoped scope.rootRef) scopes the collection to that element\'s flattened subtree instead of the whole page: maxNodes, the byte ceiling, the scan window, and the iframe marker all become subtree-relative, so a subtree that fits reports truncated:false and absence inside it is provable; unknown, expired, consumed, non-element, or detached within refs reject instead of falling back to the whole page. Every node carries parentRef (the nearest emitted composed ancestor, null at the top), and the scope carries a fresh rootRef that keeps binding the root even when hidden. anchor_last_action verifies in-page, against the original acted handle, whether the last acted element is still connected and inside the within subtree (ANCHOR_UNAVAILABLE when none). Editable controls carry a bounded value; secret-bearing fields (passwords, autocomplete secrets, CSS-masked fields) are marked valueWithheld and never exposed. Interactive nodes carry opaque refs tied to this Agent, page, observation epoch, fingerprint, and short expiry. Observe again after every dispatched action.',
+    description: 'Return a bounded semantic view of the active page main frame only: iframe content is never included (its presence sets truncated), and hidden or zero-size elements are excluded (hiddenMatches counts them; hiddenMatchesPartial marks the count a lower bound). At most 500 selector matches are scanned; whenever a visible match could not be emitted - scan window, node or byte budget, an iframe, or unresolved slot assignment - truncated is true and truncationReasons names every cause, so an absent node is never silently read as absent from the page. A within ref (from the latest browser_observe, including a scoped scope.rootRef) scopes the collection to that element\'s flattened subtree instead of the whole page: maxNodes, the byte ceiling, the scan window, and the iframe marker all become subtree-relative, so a subtree that fits reports truncated:false and absence inside it is provable; unknown, expired, consumed, non-element, or detached within refs reject instead of falling back to the whole page. Every node carries parentRef (the nearest emitted composed ancestor, null at the top), and the scope carries a fresh rootRef that keeps binding the root even when hidden. anchor_last_action verifies in-page, against the original acted handle, whether the last acted element is still connected and inside the within subtree (ANCHOR_UNAVAILABLE when none). verify_coverage runs a bounded CDP probe over the observed subtree after collection to detect closed shadow roots (content they render is invisible to the projection): coverage reports {verified, closedShadowRoots, probedNodes, reason?}; found roots push the closed-shadow-root truncation reason, an incomplete probe pushes shadow-coverage-unverified, and only coverage.verified:true lets truncated:false be read as a complete projection — use it only on the terminal absence-proof path, never on settle polls (without it coverage is {verified:false, reason:skipped} at no extra cost). Editable controls carry a bounded value; secret-bearing fields (passwords, autocomplete secrets, CSS-masked fields) are marked valueWithheld and never exposed. Interactive nodes carry opaque refs tied to this Agent, page, observation epoch, fingerprint, and short expiry. Observe again after every dispatched action.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -218,6 +224,7 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
         max_nodes: { type: 'integer', description: 'Maximum semantic nodes to return (1..100, default 60).' },
         within: { type: 'string', description: 'Optional ref from the latest browser_observe (including scope.rootRef): collect semantic nodes from the flattened subtree rooted at that element (subtree-relative budgets, truncated:false when the subtree fits) instead of the whole page.' },
         anchor_last_action: { type: 'boolean', const: true, description: 'Report an anchor for the element the driver last dispatched an action on: connected, contained in the within subtree, and its fresh ref; rejects ANCHOR_UNAVAILABLE when no action target is retained.' },
+        verify_coverage: { type: 'boolean', const: true, description: 'After collection, run a bounded CDP probe (5,000-node / 250ms caps) over the observed subtree to detect closed shadow roots; found roots push truncation reason closed-shadow-root, an incomplete probe pushes shadow-coverage-unverified, and only coverage.verified:true makes truncated:false provably complete. Use only on the terminal absence-proof path.' },
       },
     },
     output: outputFor(observationSchema),
@@ -228,6 +235,7 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
         ...(args.max_nodes === undefined ? {} : { maxNodes: args.max_nodes }),
         ...(args.within === undefined ? {} : { within: args.within }),
         ...(args.anchor_last_action === undefined ? {} : { anchorLastAction: args.anchor_last_action }),
+        ...(args.verify_coverage === undefined ? {} : { verifyCoverage: args.verify_coverage }),
       }, exec.signal)
     },
     presentCall: () => ({ card: 'generic', title: 'Observe browser semantics' }),

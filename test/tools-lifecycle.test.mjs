@@ -33,6 +33,7 @@ function fakeDriver(events = []) {
         page: { ...page, viewport: { width: 1280, height: 800 } }, scope: null, nodes: [], truncated: false,
         limits: { maxNodes: 60, maxBytes: 49152 },
         hiddenMatches: 0, hiddenMatchesPartial: false,
+        coverage: { verified: false, reason: 'skipped', closedShadowRoots: 0, probedNodes: 0 },
       }
     },
     async act(ownerId, action) {

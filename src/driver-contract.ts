@@ -126,6 +126,55 @@ export interface BrowserObservationOptions {
    * null anchor.
    */
   anchorLastAction?: true
+  /**
+   * v9 (Phase C): run a BOUNDED CDP coverage probe after collection, over the
+   * observed subtree (the within root's subtree, or the whole document for a
+   * whole-page observe), to detect CLOSED shadow roots among ALL element
+   * descendants — non-semantic hosts included. Closed roots are invisible
+   * in-page (Element.shadowRoot is null for them), so the content they render
+   * is missing from the projection while the light tree can still look
+   * complete. The probe walks the CDP DOM tree (DOM.getDocument /
+   * DOM.describeNode with depth -1 and pierce:true, shadow roots and embedded
+   * frame documents included) under a hard node cap (5,000 DOM nodes) and a
+   * hard time cap (250 ms). The result's coverage reports the outcome:
+   * closedShadowRoots > 0 pushes the truncation reason closed-shadow-root;
+   * a probe that did not complete (over-budget, cdp-unavailable,
+   * root-unresolved, error) pushes shadow-coverage-unverified. Only
+   * coverage.verified === true lets a consumer read truncated:false as
+   * "every semantic node of the subtree is in the projection". Without this
+   * flag the observation carries coverage {verified:false, reason:'skipped'}
+   * and NO extra truncation reason — ordinary polls are unchanged in cost
+   * and in truncated semantics. Use it only on the terminal absence-proof
+   * path, never on settle polls.
+   */
+  verifyCoverage?: true
+}
+
+/** v9 (Phase C): per-observation evidence from the bounded CDP coverage probe. */
+export interface BrowserCoverageEvidence {
+  /**
+   * True ONLY when the probe ran to completion within its node and time
+   * budgets AND found zero closed shadow roots in the observed subtree. Only
+   * then may a consumer treat truncated:false as "every semantic node of the
+   * subtree is in the projection" (modulo the observable-nodes semantics).
+   * False whenever the probe was skipped, stopped by a budget, could not run,
+   * or found closed roots.
+   */
+  verified: boolean
+  /** Closed shadow roots found in the observed subtree. A completed probe with none reports 0; an incomplete probe reports what it counted before stopping. */
+  closedShadowRoots: number
+  /** DOM nodes the probe walked before it finished or stopped. */
+  probedNodes: number
+  /**
+   * Why the probe is NOT verified evidence, absent on the two completed
+   * outcomes (none found -> verified:true; roots found -> verified:false with
+   * closedShadowRoots naming the count). 'skipped': verifyCoverage was not
+   * requested. 'over-budget': the node cap (5,000) or the time cap (250 ms)
+   * was exceeded. 'cdp-unavailable': the CDP session could not be created.
+   * 'root-unresolved': the within handle could not be mapped to a CDP backend
+   * node. 'error': any other probe failure.
+   */
+  reason?: 'skipped' | 'over-budget' | 'cdp-unavailable' | 'root-unresolved' | 'error'
 }
 
 /** v8+: the root of a scoped observation, as the driver observed it. */
@@ -310,6 +359,15 @@ export interface BrowserObservation {
    */
   anchor?: BrowserObservationAnchor
   /**
+   * v9 (Phase C): coverage evidence for THIS observation, always present.
+   * Without verifyCoverage it is {verified:false, reason:'skipped',
+   * closedShadowRoots:0, probedNodes:0} and adds no truncation reason. With
+   * verifyCoverage the bounded CDP probe ran over the observed subtree: see
+   * BrowserCoverageEvidence. coverage.verified:true is the only evidence on
+   * which a consumer may treat truncated:false as a complete projection.
+   */
+  coverage: BrowserCoverageEvidence
+  /**
    * True whenever a selector-matching element that would have been emitted was
    * not: matches beyond the 500-match scan window, nodes cut by the node/byte
    * budgets, iframe content, and unresolved slot assignment (see
@@ -324,9 +382,13 @@ export interface BrowserObservation {
    * slot-unresolved (v9: an element's slot assignment could not be resolved
    * to a walkable render position — assignedElements threw or returned
    * something unusable; the element is then not emitted, and the marker
-   * keeps the exclusion honest). Closed-shadow-root content remains outside
-   * this marker: it is invisible in-page and will be probed by the Phase C
-   * CDP coverage check.
+   * keeps the exclusion honest), closed-shadow-root (v9 Phase C: the
+   * coverage probe found at least one closed shadow root in the observed
+   * subtree; the content it renders is missing from the projection and is
+   * never pierced, only detected), and shadow-coverage-unverified (v9
+   * Phase C: verifyCoverage was requested but the probe did not run to
+   * completion — over-budget, cdp-unavailable, root-unresolved, or error —
+   * so closed-shadow-root absence is NOT proven for this observation).
    * In a scoped (within) observation every reason — the iframe marker
    * included — is relative to the subtree: an iframe elsewhere on the page
    * does not truncate the subtree view. v6's identity-binding-failed is

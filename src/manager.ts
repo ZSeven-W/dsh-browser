@@ -10,6 +10,7 @@ import type {
   BrowserAction,
   BrowserActionReceipt,
   BrowserConsoleEvidence,
+  BrowserCoverageEvidence,
   BrowserEvidence,
   BrowserEvidenceOptions,
   BrowserFrame,
@@ -60,6 +61,18 @@ const FORCED_KILL_EXIT_POLL_MS = 4_000
  * flight; the transport dies with the browser process, so skip it after this.
  */
 const FORCED_CDP_DETACH_TIMEOUT_MS = 2_000
+/**
+ * Phase C coverage probe budget: the walk stops once it has examined more
+ * than this many DOM nodes (5,000), or once the whole probe — session setup,
+ * tree fetch, and walk — exceeded the wall-clock time cap (250 ms). Either
+ * stop reports coverage {verified:false, reason:'over-budget'}; the probe
+ * NEVER claims verified beyond a budget. Chosen so the scoped fixture probe
+ * stays well under both (see scripts/bench-coverage-probe.mjs) while a
+ * real-page whole-document probe is expected to stop honestly instead of
+ * paying an unbounded DOM transfer.
+ */
+const COVERAGE_PROBE_NODE_CAP = 5_000
+const COVERAGE_PROBE_TIME_BUDGET_MS = 250
 
 type PersistentContextOptions = NonNullable<Parameters<typeof chromium.launchPersistentContext>[1]>
 type PersistentLauncher = (userDataDir: string, options: PersistentContextOptions) => Promise<BrowserContext>
@@ -131,6 +144,14 @@ interface ManagedSession {
   policySessions: Set<CDPSession>
   attachedPages: WeakSet<Page>
   readyPages: Set<Page>
+  /**
+   * Phase C coverage probe: ONE lazily created CDP session per managed
+   * session, created on the first verifyCoverage observe and reused by every
+   * later one. Bound to the page it was created for (coverageCdpPage); a page
+   * replacement or a session close releases it, and the next probe recreates.
+   */
+  coverageCdp: CDPSession | undefined
+  coverageCdpPage: Page | undefined
 }
 
 class DriverIssue extends Error {
@@ -392,6 +413,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
         policySessions: new Set(),
         attachedPages: new WeakSet(),
         readyPages: new Set(),
+        coverageCdp: undefined,
+        coverageCdpPage: undefined,
       }
       if (this.#disposed || operationSignal.aborted) {
         await context.close().catch(() => {})
@@ -678,6 +701,29 @@ export class BrowserManager implements ZSevenBrowserDriver {
           }
         }
       }
+      // Phase C coverage probe: runs ONLY when the caller requested
+      // verifyCoverage (the terminal absence-proof path — never ordinary
+      // settle polls). It runs BEFORE the previous observation's handles are
+      // released: the scoped probe resolves the within root through the live
+      // scopeRoot handle, which is one of those handles and is disposed with
+      // the previous record. It is strictly additive: targets were already
+      // built and are never touched. A completed probe that found closed
+      // roots names the count; an incomplete probe names its reason; either
+      // makes the evidence unverified, and only a completed zero-root probe
+      // verifies.
+      let coverage: BrowserCoverageEvidence = { verified: false, closedShadowRoots: 0, probedNodes: 0, reason: 'skipped' }
+      if (options.verifyCoverage === true) {
+        try {
+          coverage = await this.#abortClosesSession(
+            session,
+            signal,
+            this.#probeClosedShadowCoverage(session, scopeRoot?.handle),
+          )
+        } catch (error) {
+          if (error instanceof DriverIssue) throw error
+          coverage = { verified: false, closedShadowRoots: 0, probedNodes: 0, reason: 'error' }
+        }
+      }
       const rawUrl = session.page.url()
       const title = compact(await session.page.title().catch(() => ''), 300)
       const fingerprint = observationFingerprint(rawUrl, title, targets)
@@ -706,6 +752,10 @@ export class BrowserManager implements ZSevenBrowserDriver {
         ? await session.page.locator('iframe, frame').count()
         : scan.iframeCount
       if (iframeCount > 0) truncationReasons.push('iframe-not-traversed')
+      if (coverage.closedShadowRoots > 0) truncationReasons.push('closed-shadow-root')
+      if (options.verifyCoverage === true && coverage.reason !== undefined) {
+        truncationReasons.push('shadow-coverage-unverified')
+      }
       this.#touch(session)
       // hiddenMatchesPartial: the hidden count is exact only when nothing
       // stopped the collection early (scan window, node budget, byte budget).
@@ -748,6 +798,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
         limits: { maxNodes, maxBytes: MAX_OBSERVATION_BYTES },
         hiddenMatches,
         hiddenMatchesPartial,
+        coverage,
         ...(anchor === undefined ? {} : { anchor }),
       }
     })
@@ -1383,6 +1434,158 @@ export class BrowserManager implements ZSevenBrowserDriver {
     }
   }
 
+  /**
+   * Phase C coverage probe: one CDP session per managed session, created
+   * lazily on the first verifyCoverage observe and reused afterwards. The
+   * session is bound to the page it was created for; when that page is gone
+   * (closed, or replaced after a popup adoption) the stale session is
+   * released and the next probe creates a fresh one.
+   */
+  async #coverageSession(session: ManagedSession): Promise<CDPSession> {
+    if (session.coverageCdp !== undefined && session.coverageCdpPage === session.page) return session.coverageCdp
+    if (session.coverageCdp !== undefined) {
+      void session.coverageCdp.detach().catch(() => {})
+      session.coverageCdp = undefined
+      session.coverageCdpPage = undefined
+    }
+    const cdp = await session.context.newCDPSession(session.page)
+    session.coverageCdp = cdp
+    session.coverageCdpPage = session.page
+    cdp.on('close', () => {
+      if (session.coverageCdp === cdp) {
+        session.coverageCdp = undefined
+        session.coverageCdpPage = undefined
+      }
+    })
+    return cdp
+  }
+
+  /**
+   * Resolve the within ElementHandle to a CDP objectId using only public
+   * surfaces. Playwright's client JSHandle deliberately exposes no objectId
+   * (the remote id lives server-side), so the element is parked under a fresh
+   * unforgeable key on window for the duration of one Runtime.evaluate round
+   * trip, read back as an objectId, and removed in a finally. The page-side
+   * property is set and deleted by the driver's own evaluations only; no
+   * page behavior is patched, and a hostile page racing this window can at
+   * worst make the probe fail closed (root-unresolved/unverified), never
+   * verified. NOTE: ElementHandle.evaluate prepends the element as the first
+   * argument, so all arguments travel in ONE object to keep the page function
+   * signature unambiguous.
+   */
+  async #coverageObjectId(cdp: CDPSession, root: ElementHandle<Element>): Promise<string | null> {
+    const key = '__dshCoverageProbe' + randomUUID().replaceAll('-', '')
+    let previous: unknown
+    try {
+      previous = await root.evaluate((element, args) => {
+        const record = window as unknown as Record<string, unknown>
+        const prior = record[args.key]
+        record[args.key] = element
+        return prior
+      }, { key })
+      const evaluated = await cdp.send('Runtime.evaluate', { expression: `window[${JSON.stringify(key)}]` })
+      if (evaluated.exceptionDetails !== undefined) return null
+      const objectId = evaluated.result?.objectId
+      return typeof objectId === 'string' && objectId !== '' ? objectId : null
+    } finally {
+      await root.evaluate((_element, args) => {
+        const record = window as unknown as Record<string, unknown>
+        if (args.previous === undefined) delete record[args.key]
+        else record[args.key] = args.previous
+      }, { key, previous }).catch(() => {})
+    }
+  }
+
+  /**
+   * Phase C bounded CDP coverage probe over the observed subtree: the within
+   * root's subtree (resolved through the live ElementHandle), or the whole
+   * document for a whole-page observe. DOM.getDocument / DOM.describeNode
+   * fetch the tree with depth -1 and pierce:true so EVERY element descendant
+   * is covered — open shadow roots pierced, closed shadow roots listed on
+   * their hosts (they are never pierced, only detected), and embedded frame
+   * documents walked too. The walk counts nodes under the hard node cap and
+   * the whole probe under the hard wall-clock cap; either stop reports
+   * over-budget. Any failure to complete reports the specific reason — the
+   * probe NEVER claims verified it did not earn.
+   */
+  async #probeClosedShadowCoverage(session: ManagedSession, root: ElementHandle<Element> | undefined): Promise<BrowserCoverageEvidence> {
+    const deadline = Date.now() + COVERAGE_PROBE_TIME_BUDGET_MS
+    const overBudget = (probedNodes: number, closedShadowRoots: number): BrowserCoverageEvidence => ({
+      verified: false,
+      closedShadowRoots,
+      probedNodes,
+      reason: 'over-budget',
+    })
+    let cdp: CDPSession
+    try {
+      cdp = await this.#coverageSession(session)
+    } catch {
+      return { verified: false, closedShadowRoots: 0, probedNodes: 0, reason: 'cdp-unavailable' }
+    }
+    const boundedSend = async <T>(operation: Promise<T>): Promise<T | 'timeout'> => {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return 'timeout'
+      return Promise.race([
+        operation.then((value) => value as T | 'timeout'),
+        delay(remaining).then(() => 'timeout' as const),
+      ])
+    }
+
+    interface CdpDomNode {
+      nodeType?: number
+      nodeName?: string
+      shadowRootType?: string
+      children?: CdpDomNode[]
+      shadowRoots?: CdpDomNode[]
+      contentDocument?: CdpDomNode
+    }
+
+    let startNode: CdpDomNode
+    if (root === undefined) {
+      const documentResult = await boundedSend(
+        cdp.send('DOM.getDocument', { depth: -1, pierce: true }) as Promise<{ root: CdpDomNode }>,
+      )
+      if (documentResult === 'timeout') return overBudget(0, 0)
+      startNode = documentResult.root
+    } else {
+      let objectId: string | null
+      try {
+        objectId = await this.#coverageObjectId(cdp, root)
+      } catch {
+        objectId = null
+      }
+      if (objectId === null) return { verified: false, closedShadowRoots: 0, probedNodes: 0, reason: 'root-unresolved' }
+      const describeResult = await boundedSend(
+        cdp.send('DOM.describeNode', { objectId, depth: -1, pierce: true }) as Promise<{ node: CdpDomNode }>,
+      )
+      if (describeResult === 'timeout') return overBudget(0, 0)
+      if (describeResult.node === undefined) return { verified: false, closedShadowRoots: 0, probedNodes: 0, reason: 'root-unresolved' }
+      startNode = describeResult.node
+    }
+
+    let probedNodes = 0
+    let closedShadowRoots = 0
+    let capped = false
+    const walk = (node: CdpDomNode): void => {
+      if (capped) return
+      probedNodes += 1
+      if (probedNodes > COVERAGE_PROBE_NODE_CAP) {
+        capped = true
+        return
+      }
+      if (node.nodeType === 11 && node.shadowRootType === 'closed') closedShadowRoots += 1
+      for (const child of node.children ?? []) walk(child)
+      for (const shadow of node.shadowRoots ?? []) walk(shadow)
+      if (node.contentDocument !== undefined) walk(node.contentDocument)
+    }
+    walk(startNode)
+    if (capped) return overBudget(probedNodes, closedShadowRoots)
+    if (Date.now() > deadline) return overBudget(probedNodes, closedShadowRoots)
+    return closedShadowRoots === 0
+      ? { verified: true, closedShadowRoots: 0, probedNodes }
+      : { verified: false, closedShadowRoots, probedNodes }
+  }
+
   async #writeCaptureFile(session: ManagedSession, png: Buffer): Promise<string> {
     const capturesDir = join(session.userDataDir, 'captures')
     await mkdir(capturesDir, { recursive: true })
@@ -1651,7 +1854,10 @@ export class BrowserManager implements ZSevenBrowserDriver {
       if (priorAnchor) void priorAnchor.dispose().catch(() => {})
       session.readyPages.clear()
       session.secret.fill(0)
-      for (const cdp of session.policySessions) {
+      const detachableSessions = session.coverageCdp === undefined
+        ? [...session.policySessions]
+        : [...session.policySessions, session.coverageCdp]
+      for (const cdp of detachableSessions) {
         // detach() can hang on an in-flight Fetch-paused navigation; bound it.
         await Promise.race([
           cdp.detach().catch(() => {}),
@@ -1659,6 +1865,8 @@ export class BrowserManager implements ZSevenBrowserDriver {
         ])
       }
       session.policySessions.clear()
+      session.coverageCdp = undefined
+      session.coverageCdpPage = undefined
       await this.#closeContextBounded(session)
       session.closing = false
     }

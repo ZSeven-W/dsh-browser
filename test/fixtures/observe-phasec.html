@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Phase C coverage fixture</title>
+  <!--
+    Static page pinning the Phase C verifyCoverage probe contract.
+    Four regions, each a scoped-observation target:
+      imperative-closed-region  an imperative attachShadow({mode:'closed'})
+                                host inside the region (closed-imperative-button
+                                is invisible to the in-page projection);
+      declarative-closed-region  a declarative <template shadowrootmode="closed">
+                                host inside the region;
+      nested-open-region         an OPEN root whose shadow content itself hosts
+                                a CLOSED root (the probe must find closed roots
+                                nested inside open roots);
+      clean-region               no shadow roots at all.
+    Every region keeps light-DOM buttons so the region has a render box and is
+    emitted as nodes[0] of its scoped view.
+  -->
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    h1 { margin: 0; height: 40px; line-height: 40px; font-size: 24px; }
+    .box { display: block; width: 240px; height: 24px; margin: 0; padding: 0; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <h1>Phase C fixture</h1>
+  <div id="imperative-closed-region" role="region" aria-label="Imperative closed region">
+    <button class="box">imperative-light-button</button>
+    <div id="imperative-closed-host"></div>
+  </div>
+  <div id="declarative-closed-region" role="region" aria-label="Declarative closed region">
+    <button class="box">declarative-light-button</button>
+    <div id="declarative-closed-host">
+      <template shadowrootmode="closed">
+        <button style="display:block;width:240px;height:24px;margin:0;padding:0;box-sizing:border-box">closed-declarative-button</button>
+      </template>
+    </div>
+  </div>
+  <div id="nested-open-region" role="region" aria-label="Nested open region">
+    <button class="box">nested-light-button</button>
+    <div id="nested-open-host"></div>
+  </div>
+  <div id="clean-region" role="region" aria-label="Clean region">
+    <button class="box">clean-button</button>
+  </div>
+  <script>
+    const imperativeHost = document.getElementById('imperative-closed-host')
+    const imperativeRoot = imperativeHost.attachShadow({ mode: 'closed' })
+    imperativeRoot.innerHTML = '<button style="display:block;width:240px;height:24px;margin:0;padding:0;box-sizing:border-box">closed-imperative-button</button>'
+
+    // A closed root NESTED inside an open root: the in-page walk pierces the
+    // open root (open-pierced-button is emitted), misses the closed one
+    // (nested-closed-button), and only the CDP probe can find it.
+    const nestedHost = document.getElementById('nested-open-host')
+    const nestedRoot = nestedHost.attachShadow({ mode: 'open' })
+    nestedRoot.innerHTML = '<button id="open-pierced-button" style="display:block;width:240px;height:24px;margin:0;padding:0;box-sizing:border-box">open-pierced-button</button><div id="inner-closed-host"></div>'
+    const innerClosed = nestedRoot.getElementById('inner-closed-host')
+    const innerRoot = innerClosed.attachShadow({ mode: 'closed' })
+    innerRoot.innerHTML = '<button style="display:block;width:240px;height:24px;margin:0;padding:0;box-sizing:border-box">nested-closed-button</button>'
+  </script>
+</body>
+</html>
