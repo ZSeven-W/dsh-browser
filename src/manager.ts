@@ -137,6 +137,14 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
   return Math.max(min, Math.min(max, Math.trunc(value)))
 }
 
+// Pgrep -f takes a POSIX extended regular expression; a raw profile path
+// containing '.', '(', '[', or another metacharacter must never widen or
+// break the match. The ps fallback keeps the raw token with an exact
+// substring check, so only the pattern path is escaped.
+export function escapePgrepLiteral(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/gu, '\\$&')
+}
+
 function execFileAsync(file: string, args: string[], options: { maxBuffer: number }): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(file, args, options, (error, stdout) => {
@@ -1576,9 +1584,11 @@ export class BrowserManager implements ZSevenBrowserDriver {
     }
     // The leading dashes are written as [-][-] so pgrep never parses the token
     // as an option; the exact --user-data-dir flag is what identifies every
-    // process belonging to THIS session's profile.
+    // process belonging to THIS session's profile. The path is regex-escaped
+    // before interpolation so a profile directory containing '.', '(', '[',
+    // or another metacharacter can neither widen nor break the match.
     const token = `--user-data-dir=${session.userDataDir}`
-    const pattern = `[-][-]user-data-dir=${session.userDataDir}`
+    const pattern = `[-][-]user-data-dir=${escapePgrepLiteral(session.userDataDir)}`
     const pids = new Set<number>()
     try {
       const stdout = await execFileAsync('pgrep', ['-f', pattern], { maxBuffer: 16 * 1024 * 1024 })
