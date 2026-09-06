@@ -112,6 +112,21 @@ export interface BrowserObservationOptions {
    * when the visibility gate excluded it from nodes. An unknown, expired,
    * consumed, non-element, or detached within ref refuses the call with a
    * distinct rejection — it never silently falls back to a whole-page view.
+   *
+   * v9 scoped-proof retention (additive): a dispatched action consumes the
+   * observation that minted the ref, and after it exactly TWO bindings
+   * survive. One is the acted element (see anchorLastAction). The other is
+   * the scope root of the consumed observation when it was scoped: the
+   * driver retains that root per session, so observe({ within: <that
+   * observation's scope.rootRef> }) — or the literal alias within:
+   * 'last-scope' — re-scopes the projection to the SAME root after the
+   * action and before the next observe. The retained root is checked exactly
+   * like a live within ref (connected element identity — TARGET_CHANGED /
+   * WITHIN_NOT_ELEMENT); a missing or released retention (no scoped action
+   * yet, navigation, or an observe in between) refuses with the distinct
+   * SCOPE_UNAVAILABLE. Every OTHER ref — a plain node ref from the consumed
+   * observation included — keeps today's refusal (OBSERVATION_REQUIRED
+   * after an action), so ordinary ref semantics are unchanged.
    */
   within?: string
   /**
@@ -187,7 +202,10 @@ export interface BrowserObservationScope {
    * scoped view); when the visibility gate excluded the root, the root is
    * absent from nodes but rootRef still binds it, so a follow-up
    * observe({ within: scope.rootRef }) keeps resolving while the root stays
-   * hidden.
+   * hidden. After a dispatched action on this observation, the driver
+   * retains the root itself, so observe({ within: scope.rootRef }) — or the
+   * literal alias 'last-scope' — keeps resolving until the next observation
+   * (see BrowserObservationOptions.within).
    */
   rootRef: string
   role: string

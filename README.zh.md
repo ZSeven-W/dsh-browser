@@ -39,7 +39,7 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 
 ## 限定范围观察（v8）
 
-整页投影被限制在 100 个节点和 48 KiB 输出预算内，因此 DOM 顺序深处的目标（如信息框链接、页脚控件）无论视口如何都永远无法出现。`browser_observe` 支持可选的 `within` ref（来自最新一次观察，包括限定观察自身的 `scope.rootRef`）：驱动像解析动作 ref 一样解析它（同样的过期/失效规则与拒绝词汇），随后只从该元素的 flattened 子树收集语义节点 —— 相同的选择器、相同的 flattened slot / open shadow root 遍历、相同的原子 handle 捕获。`maxNodes`、字节上限、500 匹配扫描窗口与 iframe 截断标记全部变为子树相对：子树完整装下时返回 `truncated: false` 且无任何原因，容器内的“不存在”从此可被证明。结果的 `scope` 回显根节点（`{ ref, role, name, tag, rootRef }`；整页观察为 `null`），而每个节点的 `inViewport` 始终保持整页视口含义。拒绝一律 fail closed，绝不静默回退为整页视图：`REF_INVALID`（格式错误）、`OBSERVATION_REQUIRED`（观察已失效）、`REF_UNKNOWN`（未知或已消费的 ref）、`REF_EXPIRED`、`PAGE_CHANGED`、`TARGET_CHANGED`（已脱离或已被替换）、`TARGET_UNBINDABLE`（无活动绑定）以及 `WITHIN_NOT_ELEMENT`（根节点不是元素）。
+整页投影被限制在 100 个节点和 48 KiB 输出预算内，因此 DOM 顺序深处的目标（如信息框链接、页脚控件）无论视口如何都永远无法出现。`browser_observe` 支持可选的 `within` ref（来自最新一次观察，包括限定观察自身的 `scope.rootRef`）：驱动像解析动作 ref 一样解析它（同样的过期/失效规则与拒绝词汇），随后只从该元素的 flattened 子树收集语义节点 —— 相同的选择器、相同的 flattened slot / open shadow root 遍历、相同的原子 handle 捕获。`maxNodes`、字节上限、500 匹配扫描窗口与 iframe 截断标记全部变为子树相对：子树完整装下时返回 `truncated: false` 且无任何原因，容器内的“不存在”从此可被证明。结果的 `scope` 回显根节点（`{ ref, role, name, tag, rootRef }`；整页观察为 `null`），而每个节点的 `inViewport` 始终保持整页视口含义。拒绝一律 fail closed，绝不静默回退为整页视图：`REF_INVALID`（格式错误）、`OBSERVATION_REQUIRED`（观察已失效）、`REF_UNKNOWN`（未知或已消费的 ref）、`REF_EXPIRED`、`PAGE_CHANGED`、`TARGET_CHANGED`（已脱离或已被替换）、`TARGET_UNBINDABLE`（无活动绑定）、`WITHIN_NOT_ELEMENT`（根节点不是元素）以及 `SCOPE_UNAVAILABLE`（保留的 scope 根缺失，或因导航 / 下一次观察而被释放）。
 
 ## 身份与祖先链（v9）
 
@@ -51,7 +51,9 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 
 限定观察的 `scope` 携带 `rootRef`：在**本次**观察中为该根元素铸造的 ref。根元素被输出时它就是 `nodes[0]` 且 `rootRef` 与其 ref 相同；当可见性门控把它排除时，根可能不在 `nodes` 中，但 `rootRef` 仍然绑定它 —— 后续 `observe({ within: scope.rootRef })` 会沿用同样的过期/失效词汇继续解析。
 
-`observe({ anchorLastAction: true })` 返回驱动最后一次派发动作所作用元素的身份锚点 —— 派发时使用的原始 handle，绝不经重新匹配。驱动按会话保留该 handle（每次已派发动作都会替换；无元素目标的动作会清除；导航/dispose 时释放），并在页面内校验该元素是否仍处于连接状态、是否位于 `within` 子树内（composed containment：parent/host/assignedSlot 链）。`anchor: { ref, connected, contained }` —— 元素在本次观察中被输出时 `ref` 是其新 ref（被门控或预算排除时为 `null`，此时 `connected`/`contained` 依然真实），整页观察时 `contained` 为 `null`。没有保留的动作目标时，调用以 `ANCHOR_UNAVAILABLE` 拒绝 —— 绝不静默返回 null。
+已派发动作会使铸造这些 ref 的观察失效，失效后**恰好有两个绑定**存活。其一是被动作的元素：`observe({ anchorLastAction: true })` 返回驱动最后一次派发动作所作用元素的身份锚点 —— 派发时使用的原始 handle，绝不经重新匹配。驱动按会话保留该 handle（每次已派发动作都会替换；无元素目标的动作会清除；导航/dispose 时释放），并在页面内校验该元素是否仍处于连接状态、是否位于 `within` 子树内（composed containment：parent/host/assignedSlot 链）。`anchor: { ref, connected, contained }` —— 元素在本次观察中被输出时 `ref` 是其新 ref（被门控或预算排除时为 `null`，此时 `connected`/`contained` 依然真实），整页观察时 `contained` 为 `null`。没有保留的动作目标时，调用以 `ANCHOR_UNAVAILABLE` 拒绝 —— 绝不静默返回 null。
+
+另一个幸存者是 scope 根：当被动作消费的观察是限定观察时，驱动按会话保留它的 scope 根（连同该观察的 `scope` 元数据与它铸造的新 `rootRef`）。在下一次观察之前，`observe({ within: <该 scope.rootRef> })` —— 或字面别名 `within: 'last-scope'` —— 通过保留的 handle 解析，并把投影重新限定到**同一个**根上：长页面上从限定视图发起的滚动，其效果因此可以在该 scope 内被**证明**。保留的根通过与会话内 `within` ref 相同的 fail-closed 校验（`isConnected`、元素节点、身份一致性 —— `TARGET_CHANGED` / `WITHIN_NOT_ELEMENT`），并与 `anchorLastAction` 协同工作（锚点包含性相对该根度量）。该保留会被下一次已派发动作替换、在导航/dispose 时释放并销毁、被下一次成功观察消费（完全释放）；保留缺失或已释放 —— 以及**其他任何** ref，包括被消费观察中的普通节点 ref —— 一律以 `SCOPE_UNAVAILABLE` / 上述普通词汇拒绝，绝不回退为整页视图。
 
 ## 已验证边界（v9, Phase C）
 
@@ -114,7 +116,7 @@ import {
 } from '@zseven-w/dsh-browser/driver'
 ```
 
-服务会声明 `kind: "browser"` 和 `contractVersion: 9`（v9：每个节点都带 `parentRef` —— 最近被输出的 composed 祖先；限定 `scope` 携带新的 `rootRef`，即使根被门控排除仍保持绑定；`observe({ anchorLastAction: true })` 返回最后动作元素的身份锚点，否则以 `ANCHOR_UNAVAILABLE` 拒绝；遍历遵循 flattened slot 指派，无法解析时标记 `slot-unresolved`；观察报告 `hiddenMatches`/`hiddenMatchesPartial`；Phase C 新增 `observe({ verifyCoverage: true })` —— 有界 CDP closed-shadow-root 探针，其每次观察的 `coverage` 证据是把 `truncated:false` 解读为完整投影的唯一依据。v8：`observe` 支持可选的 `within` ref，将投影限定到某个元素的子树并使用子树相对预算，每次观察都会报告 `scope`；v7 新增了 `bindable` 节点标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
+服务会声明 `kind: "browser"` 和 `contractVersion: 9`（v9：每个节点都带 `parentRef` —— 最近被输出的 composed 祖先；限定 `scope` 携带新的 `rootRef`，即使根被门控排除仍保持绑定；`observe({ anchorLastAction: true })` 返回最后动作元素的身份锚点，否则以 `ANCHOR_UNAVAILABLE` 拒绝；已派发动作会保留被消费限定观察的 scope 根，因此 `observe({ within: scope.rootRef })` 或 `within: 'last-scope'` 会在下一次观察之前持续重新限定到该根，保留消失后以 `SCOPE_UNAVAILABLE` 拒绝；遍历遵循 flattened slot 指派，无法解析时标记 `slot-unresolved`；观察报告 `hiddenMatches`/`hiddenMatchesPartial`；Phase C 新增 `observe({ verifyCoverage: true })` —— 有界 CDP closed-shadow-root 探针，其每次观察的 `coverage` 证据是把 `truncated:false` 解读为完整投影的唯一依据。v8：`observe` 支持可选的 `within` ref，将投影限定到某个元素的子树并使用子树相对预算，每次观察都会报告 `scope`；v7 新增了 `bindable` 节点标记，见 `BrowserSemanticNode`）。`visualObserve` 方法只捕获有界 PNG 与 Set-of-Mark 标签（像素 + 框），不做任何理解、OCR 或差异对比。上层插件应通过 Cordis `ctx.inject([BROWSER_DRIVER_SERVICE], ...)` 获取，不应导入 Manager 内部实现，也不能跨 Agent 复用模型 Ref。`disposeScope(ownerId)` 会同时等待迟到的启动并关闭已运行 Session；插件通过结构化 `agent/disposed` 生命周期钩子调用它。
 
 ## 已验证范围与限制
 

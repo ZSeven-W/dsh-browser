@@ -41,6 +41,8 @@ import {
 } from './semantic.js'
 import { analyzePng, measureSemanticBoxesByHandles } from './visual.js'
 
+/** Literal within alias for the scope root retained across the last dispatched action. */
+const LAST_SCOPE_ALIAS = 'last-scope'
 const DEFAULT_OBSERVATION_TTL_MS = 30_000
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000
 const DEFAULT_ACTION_TIMEOUT_MS = 15_000
@@ -106,6 +108,35 @@ interface ObservationRecord {
    * though the node list does not carry it.
    */
   scopeRoot?: { ref: string; target: StoredSemanticTarget }
+  /**
+   * The public scope echo of a scoped observation (the same fields the
+   * caller receives). Always present when the observation was scoped, so
+   * act() can carry the scope root across the observation's release even
+   * when the root was emitted (no scopeRoot binding exists then: the root's
+   * live binding is its node target). Absent for whole-page observations.
+   */
+  scope?: { ref: string; rootRef: string; role: string; name: string; tag: string }
+}
+
+/**
+ * v9 scoped-proof retention: the scope root of the scoped observation a
+ * dispatched action consumed, carried across that observation's release so
+ * observe({ within: rootRef | 'last-scope' }) can re-scope to the SAME root
+ * after the action. The target keeps the root's live ElementHandle (the
+ * identity binding, never a re-matched node); navigation disposes the handle
+ * and leaves this record inert so the refusal stays distinct
+ * (SCOPE_UNAVAILABLE) until the next observation replaces the record.
+ */
+interface RetainedScopeRoot {
+  /** The ref the caller passed as within to the consumed observation. */
+  ref: string
+  /** The fresh ref the consumed observation minted for its root. */
+  rootRef: string
+  role: string
+  name: string
+  tag: string
+  /** The stored root target (identity + live handle). */
+  target: StoredSemanticTarget
 }
 
 interface ManagedSession {
@@ -126,6 +157,18 @@ interface ManagedSession {
    * observe({ anchorLastAction: true }) measures it in-page.
    */
   lastActionTarget: ElementHandle<Element> | undefined
+  /**
+   * v9 scoped-proof retention: the scope root of the scoped observation the
+   * last dispatched action consumed — its ORIGINAL ElementHandle plus the
+   * consumed observation's scope echo. Set only when the consumed
+   * observation was scoped and the action did not change the page; replaced
+   * by the next dispatched act, released (handle disposed, record left
+   * inert) by navigation, and fully released by the next successful
+   * observe. Until then observe({ within: rootRef | 'last-scope' })
+   * resolves through it; a missing or released retention refuses with
+   * SCOPE_UNAVAILABLE, and every other ref keeps today's refusal.
+   */
+  lastScopeRoot: RetainedScopeRoot | undefined
   console: BrowserConsoleEvidence[]
   network: BrowserNetworkEvidence[]
   consoleDropped: number
@@ -398,6 +441,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
         epoch: 0,
         observation: undefined,
         lastActionTarget: undefined,
+        lastScopeRoot: undefined,
         console: [],
         network: [],
         consoleDropped: 0,
@@ -569,7 +613,12 @@ export class BrowserManager implements ZSevenBrowserDriver {
         if (typeof options.within !== 'string' || options.within.trim() === '' || options.within.length > 128) {
           throw new DriverIssue('REF_INVALID', 'within must be a short opaque ref from the latest browser_observe', true)
         }
-        const resolved = await this.#resolveTarget(session, options.within, signal, true)
+        // v9 scoped-proof retention: after a dispatched action the consumed
+        // observation is gone, but its scope root survives in
+        // session.lastScopeRoot — resolve the within ref through it (its
+        // minted rootRef, or the literal 'last-scope' alias) exactly where a
+        // plain ref still refuses with OBSERVATION_REQUIRED.
+        const resolved = await this.#resolveWithin(session, options.within, signal)
         const nodeType = await this.#abortClosesSession(
           session,
           signal,
@@ -735,8 +784,24 @@ export class BrowserManager implements ZSevenBrowserDriver {
         expiresAtMs,
         targets: new Map(targets.map((target) => [target.ref, target])),
         ...(scopeRootTarget === undefined ? {} : { scopeRoot: { ref: scopeRootTarget.ref, target: scopeRootTarget } }),
+        ...(scopeRoot === undefined ? {} : {
+          scope: {
+            ref: scopeRoot.ref,
+            rootRef: rootRef as string,
+            role: scopeRoot.target.role,
+            name: scopeRoot.target.name,
+            tag: scopeRoot.target.tag,
+          },
+        }),
       }
       if (previous) void this.#disposeObservationHandles(previous)
+      // The post-action retained scope root is consumed by THIS successful
+      // observation — either as its collection root (a post-action within) or
+      // simply superseded. Only a successful observation releases it: a
+      // refused observe leaves the retention intact for a retry.
+      const priorScopeRoot = session.lastScopeRoot
+      session.lastScopeRoot = undefined
+      this.#releaseScopeRoot(priorScopeRoot)
       const viewport = session.page.viewportSize() ?? { width: 0, height: 0 }
       const truncationReasons: string[] = []
       if (scan.scanned < scan.totalMatches) truncationReasons.push('scan-window-exceeded')
@@ -1225,6 +1290,41 @@ export class BrowserManager implements ZSevenBrowserDriver {
           }
           active.lastActionTarget = nextAnchor
           if (priorAnchor !== undefined && priorAnchor !== nextAnchor) void priorAnchor.dispose().catch(() => {})
+          // v9 scoped-proof retention: when the consumed observation was
+          // scoped, its scope root also survives the observation's release
+          // (the same peel pattern as the anchor: the root's live binding is
+          // transferred out of the record, which is then disposed without
+          // it). Only an action that kept the page can retain it; an action
+          // that navigated leaves the retention untouched — the
+          // framenavigated release already disposed any prior handle — so a
+          // follow-up within refuses with SCOPE_UNAVAILABLE instead of
+          // binding across the page change.
+          const priorScopeRoot = active.lastScopeRoot
+          let nextScopeRoot: RetainedScopeRoot | undefined
+          if (previous?.scope !== undefined && pageAfter.url === pageBefore.url) {
+            const stored = previous.scopeRoot !== undefined
+              ? previous.scopeRoot.target
+              : previous.targets.get(previous.scope.rootRef)
+            if (stored?.handle !== undefined) {
+              // Transfer the live binding OUT of the consumed record (which
+              // is disposed next) into the retained one; the retained target
+              // is a clone so the transfer can never clear its own handle.
+              const rootHandle = stored.handle
+              stored.handle = undefined
+              nextScopeRoot = {
+                ref: previous.scope.ref,
+                rootRef: previous.scope.rootRef,
+                role: previous.scope.role,
+                name: previous.scope.name,
+                tag: previous.scope.tag,
+                target: { ...stored, handle: rootHandle },
+              }
+            }
+          }
+          if (pageAfter.url === pageBefore.url) {
+            active.lastScopeRoot = nextScopeRoot
+            if (priorScopeRoot !== undefined) this.#releaseScopeRoot(priorScopeRoot)
+          }
           void this.#disposeObservationHandles(previous)
         }
         if (!active.closed) this.#touch(active)
@@ -1332,6 +1432,71 @@ export class BrowserManager implements ZSevenBrowserDriver {
 
   async #abortClosesSession<T>(session: ManagedSession, signal: AbortSignal | undefined, operation: Promise<T>): Promise<T> {
     return waitForAbortable(operation, signal, () => { this.#scheduleClose(session) })
+  }
+
+  /**
+   * Resolve a within ref for observe(): the ordinary path (the latest live
+   * observation, including its own scopeRoot binding) plus the v9 scoped-
+   * proof retention. After a dispatched action the observation is gone, and
+   * the ONLY ref that can still resolve is the scope root retained by that
+   * action — its minted rootRef, or the literal alias 'last-scope'. Every
+   * other ref keeps today's OBSERVATION_REQUIRED refusal, so ordinary ref
+   * semantics are unchanged. The retained root gets the same fail-closed
+   * identity checks as a live ref (TARGET_CHANGED for a removed/replaced
+   * element); a missing or released binding (no scoped action yet,
+   * navigation, or an observe in between) refuses with the distinct
+   * SCOPE_UNAVAILABLE — never a whole-page fallback.
+   */
+  async #resolveWithin(session: ManagedSession, ref: string, signal?: AbortSignal): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
+    const observation = session.observation
+    const retained = session.lastScopeRoot
+    const isAlias = ref === LAST_SCOPE_ALIAS
+    const matchesRetained = retained !== undefined && ref === retained.rootRef
+    if (!isAlias && !matchesRetained) {
+      if (observation !== undefined) return this.#resolveTarget(session, ref, signal, true)
+      throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', true)
+    }
+    if (observation !== undefined) {
+      // A live observation means the retention was already released by it
+      // (matchesRetained is then unreachable; the alias is reachable and
+      // names nothing anymore).
+      throw new DriverIssue('SCOPE_UNAVAILABLE', 'no scope root is retained: the latest observation already replaced the post-action retention; observe within a fresh ref', true)
+    }
+    if (retained === undefined) {
+      throw new DriverIssue('SCOPE_UNAVAILABLE', 'no scope root is retained from the last dispatched action; dispatch an action on a scoped observation, then observe within its scope root', true)
+    }
+    const handle = retained.target.handle
+    if (handle === undefined) {
+      // Navigation or dispose released the live binding; the inert record
+      // stays just long enough to refuse distinctly instead of falling back.
+      throw new DriverIssue('SCOPE_UNAVAILABLE', 'the retained scope root belonged to a document that no longer exists; observe again', true)
+    }
+    const connected = await this.#abortClosesSession(
+      session,
+      signal,
+      handle.evaluate((element) => element.isConnected),
+    ).catch(() => null)
+    if (connected === null) {
+      // The retained handle's execution context no longer exists (a
+      // navigation raced the framenavigated release): same refusal as a
+      // missing binding — the binding is gone, not the element.
+      throw new DriverIssue('SCOPE_UNAVAILABLE', 'the retained scope root belonged to a document that no longer exists; observe again', true)
+    }
+    if (!connected) {
+      throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true)
+    }
+    const bound = await inspectSemanticHandle(handle, retained.target.selector).catch(() => null)
+    if (!bound || semanticFingerprint(bound) !== retained.target.fingerprint) {
+      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', true)
+    }
+    return { target: bound, handle }
+  }
+
+  #releaseScopeRoot(root: RetainedScopeRoot | undefined): void {
+    if (root === undefined) return
+    const handle = root.target.handle
+    root.target.handle = undefined
+    if (handle !== undefined) void handle.dispose().catch(() => {})
   }
 
   async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal, failureRejected = true): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
@@ -1658,6 +1823,16 @@ export class BrowserManager implements ZSevenBrowserDriver {
         const priorAnchor = session.lastActionTarget
         session.lastActionTarget = undefined
         if (priorAnchor) void priorAnchor.dispose().catch(() => {})
+        // The retained scope root's live binding dies with the document
+        // too; the inert record survives so a follow-up within: rootRef /
+        // 'last-scope' refuses with the distinct SCOPE_UNAVAILABLE instead
+        // of binding across the page change. The next successful observe
+        // replaces the record entirely.
+        const priorScopeRoot = session.lastScopeRoot
+        if (priorScopeRoot !== undefined && priorScopeRoot.target.handle !== undefined) {
+          void priorScopeRoot.target.handle.dispose().catch(() => {})
+          priorScopeRoot.target.handle = undefined
+        }
       }
       if (frame !== page.mainFrame() || this.#originAllowed(frame.url())) return
       this.#pushConsole(session, 'origin-policy', `blocked top-level origin: ${publicPageUrl(frame.url())}`, frame.url())
@@ -1852,6 +2027,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
       const priorAnchor = session.lastActionTarget
       session.lastActionTarget = undefined
       if (priorAnchor) void priorAnchor.dispose().catch(() => {})
+      const priorScopeRoot = session.lastScopeRoot
+      session.lastScopeRoot = undefined
+      this.#releaseScopeRoot(priorScopeRoot)
       session.readyPages.clear()
       session.secret.fill(0)
       const detachableSessions = session.coverageCdp === undefined
