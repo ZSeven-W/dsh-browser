@@ -188,6 +188,16 @@ test('observe on an unchanged page: smaller maxNodes lists are field-level prefi
     assert.equal(byName.get('Disabled act')?.disabled, true, 'disabled control must carry disabled')
     assert.equal(byName.get('Notes')?.value, 'leading and trailing', 'textarea value must be normalized')
     assert.equal(byName.get('Pick one')?.value, 'First', 'select must carry the selected option value')
+    // v9+ nameSource: an authored label vs descendant-text aggregation,
+    // pinned per node and compared field-wise by the prefix equality above.
+    assert.equal(byName.get('Search box')?.nameSource, 'label', 'an aria-label named input must carry nameSource label')
+    assert.equal(byName.get('Secret field')?.nameSource, 'label', 'an aria-label named password must carry nameSource label')
+    assert.equal(byName.get('Docs link')?.nameSource, 'label', 'an aria-label named link must carry nameSource label')
+    assert.equal(byName.get('Pick one')?.nameSource, 'label', 'an aria-label named select must carry nameSource label')
+    assert.equal(byName.get('Disabled act')?.nameSource, 'label', 'an aria-label named button must carry nameSource label')
+    assert.equal(byName.get('Notes')?.nameSource, 'label', 'an aria-label named textarea must carry nameSource label')
+    assert.equal(byName.get('shadow-act-0')?.nameSource, 'content', 'a plain-text button must carry nameSource content')
+    assert.equal(byName.get('header-0')?.nameSource, 'content', 'a plain-text header button must carry nameSource content')
     assert.equal(byName.get('shadow-act-0')?.inViewport, true, 'shadow-act-0 must start in the viewport')
     assert.equal(pre100.nodes.find((node) => node.name === 'row-0')?.inViewport, false, 'row-0 must start outside the viewport')
 

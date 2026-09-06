@@ -1,6 +1,6 @@
 import { createHash, createHmac } from 'node:crypto'
 import type { ElementHandle, JSHandle, Page } from 'playwright-core'
-import type { BrowserSemanticNode, TargetChangedSnapshot } from './driver-contract.js'
+import type { BrowserSemanticNode, SemanticNameSource, TargetChangedSnapshot } from './driver-contract.js'
 
 export const SEMANTIC_SELECTOR = [
   'a[href]', 'button', 'input', 'textarea', 'select', 'summary',
@@ -57,6 +57,18 @@ export interface RawSemanticCandidate {
   valueWithheld?: true
   /** True when the observable value exceeded the bound and `value` holds only its prefix. Not part of the identity fingerprint. */
   valueTruncated?: true
+  /**
+   * Where the accessible name came from, computed in the same single
+   * page-side evaluation as the name itself: 'label' when it is an authored
+   * label (aria-label, aria-labelledby, an associated <label>, alt, title,
+   * or another authored attribute/value — placeholder, an input-button's
+   * value), 'content' when it is derived from descendant text aggregation
+   * (or empty). Not part of the identity fingerprint itself, but it
+   * qualifies the name input: a CONTENT-named node with a container role
+   * has its name excluded from the within / retained scope-root identity
+   * check (see CONTENT_NAMED_CONTAINER_ROLES).
+   */
+  nameSource: SemanticNameSource
 }
 
 export interface StoredSemanticTarget extends RawSemanticCandidate {
@@ -77,6 +89,31 @@ export interface StoredSemanticTarget extends RawSemanticCandidate {
 const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' ').trim().slice(0, max)
 
 /**
+ * Container roles whose accessible name the driver derives from CONTENTS
+ * (concatenated descendant text) rather than an author-supplied label. Only
+ * a node with one of these roles can carry an aggregated, order-dependent
+ * accessible name — Wikipedia's "Part of a series on the History of China"
+ * sidebar (role navigation, tag table, a ~180-character concatenation of
+ * its descendants including hide/show toggles) is the canonical case.
+ * Mirrors dsh-qa's CONTENT_NAMED_CONTAINER_ROLES (src/explore/export.ts).
+ */
+export const CONTENT_NAMED_CONTAINER_ROLES: ReadonlySet<string> = new Set([
+  'search', 'region', 'list', 'listbox', 'group', 'navigation', 'main', 'form', 'table', 'menu',
+])
+
+/**
+ * True when the candidate's accessible name is derived from its contents AND
+ * the candidate carries a container role: the only shape whose aggregated
+ * name may change while the element itself stays the same, and therefore the
+ * only shape whose name input the within / retained scope-root identity
+ * check excludes. A label-named node — whatever its role — and a
+ * content-named leaf keep the full strict fingerprint.
+ */
+export function isContentNamedContainer(candidate: Pick<RawSemanticCandidate, 'nameSource' | 'role'>): boolean {
+  return candidate.nameSource === 'content' && CONTENT_NAMED_CONTAINER_ROLES.has(candidate.role)
+}
+
+/**
  * Identity fingerprint used to re-resolve a ref against the live DOM. It covers
  * only properties that answer "which element is this": role, name, tag,
  * inputType, interactive/editable/disabled, the visibility gate state
@@ -86,6 +123,12 @@ const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' '
  * `valueTruncated` — fill-, keystroke-, or script-dependent facts) are
  * deliberately excluded, so a value change alone never invalidates a ref the
  * way navigation or a semantic change does.
+ *
+ * The hash itself keeps the full input set (refs stay opaque and are re-minted
+ * per observation); the within / retained scope-root RESOLUTION comparison —
+ * semanticTargetDiff with tolerateContentName — is what excludes `name` for a
+ * content-named container, so a container's identity no longer depends on its
+ * aggregated content.
  */
 export function semanticFingerprint(candidate: RawSemanticCandidate): string {
   const stable = {
@@ -118,6 +161,15 @@ export interface TargetChangeDetail {
   before?: TargetChangedSnapshot
   /** Safe-subset snapshot of the LIVE element for every changed safe field. */
   after?: TargetChangedSnapshot
+  /**
+   * True when the differences are identity-EXEMPT information, not an
+   * identity break: a name-only change on a content-named container (name
+   * excluded from the within / retained scope-root check). The caller of a
+   * tolerant comparison keeps resolving and reports the change
+   * informationally; a strict comparison (act) never receives this flag and
+   * refuses on any diff.
+   */
+  informational?: true
 }
 
 /**
@@ -127,8 +179,16 @@ export interface TargetChangeDetail {
  * subset (role, name, tag, disabled, visible) — never inputType, interactive,
  * editable, download, href, and never any value field (redaction rules
  * unchanged). Returns null when the compared inputs match.
+ *
+ * With tolerateContentName (the within / retained scope-root comparison) a
+ * name-only change on a CONTENT-named container role is identity-exempt: the
+ * detail is returned with `informational: true` so the caller keeps resolving
+ * and reports the changed name informationally instead of refusing. A
+ * label-named node, a non-container node, or any other differing field is
+ * still a real identity break. Action targets (act) always compare strictly
+ * and never receive an informational detail.
  */
-export function semanticTargetDiff(observed: RawSemanticCandidate, live: RawSemanticCandidate, includeVisibility: boolean): TargetChangeDetail | null {
+export function semanticTargetDiff(observed: RawSemanticCandidate, live: RawSemanticCandidate, includeVisibility: boolean, tolerateContentName = false): TargetChangeDetail | null {
   const changed: string[] = []
   const before: TargetChangedSnapshot = {}
   const after: TargetChangedSnapshot = {}
@@ -145,9 +205,14 @@ export function semanticTargetDiff(observed: RawSemanticCandidate, live: RawSema
     }
   }
   if (changed.length === 0) return null
+  const informational = tolerateContentName
+    && changed.length === 1
+    && changed[0] === 'name'
+    && isContentNamedContainer(observed)
   return {
     changed,
     ...(Object.keys(before).length === 0 ? {} : { before, after }),
+    ...(informational ? { informational: true as const } : {}),
   }
 }
 
@@ -171,6 +236,7 @@ export function publicSemanticNode(target: StoredSemanticTarget): BrowserSemanti
     parentRef: target.parentRef,
     role: target.role,
     name: target.name,
+    nameSource: target.nameSource,
     tag: target.tag,
     interactive: target.interactive,
     editable: target.editable,
@@ -315,30 +381,30 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       }
       return element.getAttribute('tabindex') === null ? 'generic' : 'focusable'
     }
-    const accessibleName = (element: Element): string => {
+    const accessibleName = (element: Element): { name: string; source: 'label' | 'content' } => {
       const labelledBy = element.getAttribute('aria-labelledby')
       if (labelledBy) {
         const joined = labelledBy.split(/\s+/u)
           .map((id) => document.getElementById(id)?.textContent ?? '')
           .join(' ')
-        if (normalize(joined)) return normalize(joined)
+        if (normalize(joined)) return { name: normalize(joined), source: 'label' }
       }
       const aria = normalize(element.getAttribute('aria-label'))
-      if (aria) return aria
+      if (aria) return { name: aria, source: 'label' }
       if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
         const labels = Array.from(element.labels ?? []).map((label) => label.textContent ?? '').join(' ')
-        if (normalize(labels)) return normalize(labels)
+        if (normalize(labels)) return { name: normalize(labels), source: 'label' }
       }
       const alt = normalize(element.getAttribute('alt'))
-      if (alt) return alt
+      if (alt) return { name: alt, source: 'label' }
       const title = normalize(element.getAttribute('title'))
-      if (title) return title
+      if (title) return { name: title, source: 'label' }
       const placeholder = normalize(element.getAttribute('placeholder'))
-      if (placeholder) return placeholder
+      if (placeholder) return { name: placeholder, source: 'label' }
       if (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type) && normalize(element.value)) {
-        return normalize(element.value)
+        return { name: normalize(element.value), source: 'label' }
       }
-      return normalize(element.textContent)
+      return { name: normalize(element.textContent), source: 'content' }
     }
     const selectorFor = (element: Element): string => {
       const parts: string[] = []
@@ -548,8 +614,9 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       const visible = style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0
         && rect.width > 0 && rect.height > 0 && element.getClientRects().length > 0
       const href = safeHref(element)
+      const named = accessibleName(element)
       return {
-        selector: selectorFor(element), role, name: accessibleName(element), tag, inputType,
+        selector: selectorFor(element), role, name: named.name, nameSource: named.source, tag, inputType,
         interactive, editable, disabled, visible, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
@@ -720,6 +787,7 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     parentIndex: typeof value.parentIndex === 'number' ? Number(value.parentIndex) : null,
     role: compact(String(value.role || 'generic'), 60),
     name: compact(String(value.name || ''), 180),
+    nameSource: value.nameSource === 'label' ? 'label' : 'content',
     tag: compact(String(value.tag || ''), 30),
     inputType: compact(String(value.inputType || ''), 30),
     interactive: value.interactive === true,
@@ -838,30 +906,30 @@ export async function inspectSemanticHandle(
       }
       return element.getAttribute('tabindex') === null ? 'generic' : 'focusable'
     }
-    const accessibleName = (): string => {
+    const accessibleName = (): { name: string; source: 'label' | 'content' } => {
       const labelledBy = element.getAttribute('aria-labelledby')
       if (labelledBy) {
         const joined = labelledBy.split(/\s+/u)
           .map((id) => document.getElementById(id)?.textContent ?? '')
           .join(' ')
-        if (normalize(joined)) return normalize(joined)
+        if (normalize(joined)) return { name: normalize(joined), source: 'label' }
       }
       const aria = normalize(element.getAttribute('aria-label'))
-      if (aria) return aria
+      if (aria) return { name: aria, source: 'label' }
       if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
         const labels = Array.from(element.labels ?? []).map((label) => label.textContent ?? '').join(' ')
-        if (normalize(labels)) return normalize(labels)
+        if (normalize(labels)) return { name: normalize(labels), source: 'label' }
       }
       const alt = normalize(element.getAttribute('alt'))
-      if (alt) return alt
+      if (alt) return { name: alt, source: 'label' }
       const title = normalize(element.getAttribute('title'))
-      if (title) return title
+      if (title) return { name: title, source: 'label' }
       const placeholder = normalize(element.getAttribute('placeholder'))
-      if (placeholder) return placeholder
+      if (placeholder) return { name: placeholder, source: 'label' }
       if (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type) && normalize(element.value)) {
-        return normalize(element.value)
+        return { name: normalize(element.value), source: 'label' }
       }
-      return normalize(element.textContent)
+      return { name: normalize(element.textContent), source: 'content' }
     }
     const safeHref = (): string | undefined => {
       const raw = element.getAttribute('href')
@@ -893,9 +961,11 @@ export async function inspectSemanticHandle(
     const style = getComputedStyle(element)
     const visible = style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0
       && rect.width > 0 && rect.height > 0 && element.getClientRects().length > 0
+    const named = accessibleName()
     return {
       role,
-      name: accessibleName(),
+      name: named.name,
+      nameSource: named.source,
       tag,
       inputType,
       interactive,

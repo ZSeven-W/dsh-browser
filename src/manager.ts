@@ -117,7 +117,7 @@ interface ObservationRecord {
    * when the root was emitted (no scopeRoot binding exists then: the root's
    * live binding is its node target). Absent for whole-page observations.
    */
-  scope?: { ref: string; rootRef: string; role: string; name: string; tag: string }
+  scope?: { ref: string; rootRef: string; role: string; name: string; tag: string; nameChanged?: true }
 }
 
 /**
@@ -621,7 +621,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
       // (same staleness/expiry rules, same rejection vocabulary), then root
       // the collection at that element's composed subtree. A refused ref
       // rejects the call — it never silently falls back to a whole-page view.
-      let scopeRoot: { ref: string; target: RawSemanticCandidate; handle: ElementHandle<Element> } | undefined
+      let scopeRoot: { ref: string; target: RawSemanticCandidate; handle: ElementHandle<Element>; nameChanged?: true } | undefined
       if (options.within !== undefined) {
         if (typeof options.within !== 'string' || options.within.trim() === '' || options.within.length > 128) {
           throw new DriverIssue('REF_INVALID', 'within must be a short opaque ref from the latest browser_observe', true)
@@ -644,7 +644,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
         if (nodeType !== 1) {
           throw new DriverIssue('WITHIN_NOT_ELEMENT', 'the within ref resolved to a non-element DOM node; scoped observation requires an element', true)
         }
-        scopeRoot = { ref: options.within, target: resolved.target, handle: resolved.handle }
+        scopeRoot = { ref: options.within, target: resolved.target, handle: resolved.handle, ...(resolved.nameChanged === true ? { nameChanged: true as const } : {}) }
       }
       // Atomic capture: ONE page-side evaluation serializes the candidates AND
       // retains references to exactly the selected elements; ElementHandles for
@@ -804,6 +804,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
             role: scopeRoot.target.role,
             name: scopeRoot.target.name,
             tag: scopeRoot.target.tag,
+            ...(scopeRoot.nameChanged === true ? { nameChanged: true as const } : {}),
           },
         }),
       }
@@ -869,6 +870,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
               role: scopeRoot.target.role,
               name: scopeRoot.target.name,
               tag: scopeRoot.target.tag,
+              ...(scopeRoot.nameChanged === true ? { nameChanged: true as const } : {}),
             },
         nodes: targets.map(publicSemanticNode),
         truncated: truncationReasons.length > 0,
@@ -1470,20 +1472,24 @@ export class BrowserManager implements ZSevenBrowserDriver {
    * other ref keeps today's OBSERVATION_REQUIRED refusal, so ordinary ref
    * semantics are unchanged. The retained root gets the same fail-closed
    * identity checks as a live ref (TARGET_CHANGED for a removed/replaced
-   * element); a missing or released binding (no scoped action yet,
-   * navigation, or an observe in between) refuses with the distinct
-   * SCOPE_UNAVAILABLE — never a whole-page fallback.
+   * element; a name-only change on a content-named container is exempt and
+   * reported via the returned nameChanged flag); a missing or released
+   * binding (no scoped action yet, navigation, or an observe in between)
+   * refuses with the distinct SCOPE_UNAVAILABLE — never a whole-page
+   * fallback.
    */
-  async #resolveWithin(session: ManagedSession, ref: string, signal?: AbortSignal): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
+  async #resolveWithin(session: ManagedSession, ref: string, signal?: AbortSignal): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element>; nameChanged?: true }> {
     const observation = session.observation
     const retained = session.lastScopeRoot
     const isAlias = ref === LAST_SCOPE_ALIAS
     const matchesRetained = retained !== undefined && ref === retained.rootRef
     if (!isAlias && !matchesRetained) {
       // A within resolution tolerates a visibility-only change (see the
-      // retained-root check below); every other identity input refuses with
-      // the field-level diff attached.
-      if (observation !== undefined) return this.#resolveTarget(session, ref, signal, true, false)
+      // retained-root check below) and — for a CONTENT-named container — a
+      // name-only change (its aggregated name tracks descendant text, so the
+      // element is still the same node); every other identity input refuses
+      // with the field-level diff attached.
+      if (observation !== undefined) return this.#resolveTarget(session, ref, signal, true, false, true)
       throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', true)
     }
     if (observation !== undefined) {
@@ -1522,12 +1528,15 @@ export class BrowserManager implements ZSevenBrowserDriver {
     // The within path tolerates a visibility-only change: a root that became
     // hidden between observations must still resolve and keep binding (the
     // gate then honestly excludes it from nodes — see the hidden-root scope
-    // retention flow).
-    const detail = semanticTargetDiff(retained.target, bound, false)
-    if (detail !== null) {
+    // retention flow). It also exempts a name-only change on a content-named
+    // container: the aggregated name tracks descendant text (a flipped
+    // hide/show toggle), but the ELEMENT is the same node, so the resolution
+    // proceeds and reports the change informationally instead of refusing.
+    const detail = semanticTargetDiff(retained.target, bound, false, true)
+    if (detail !== null && detail.informational !== true) {
       throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', true, detail)
     }
-    return { target: bound, handle }
+    return { target: bound, handle, ...(detail?.informational === true ? { nameChanged: true as const } : {}) }
   }
 
   #releaseScopeRoot(root: RetainedScopeRoot | undefined): void {
@@ -1537,7 +1546,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (handle !== undefined) void handle.dispose().catch(() => {})
   }
 
-  async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal, failureRejected = true, strictVisibility = true): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
+  async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal, failureRejected = true, strictVisibility = true, tolerateContentName = false): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element>; nameChanged?: true }> {
     const observation = session.observation
     if (!observation) throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', failureRejected)
     if (this.#now() > observation.expiresAtMs) throw new DriverIssue('REF_EXPIRED', 'the semantic ref expired; observe again', failureRejected)
@@ -1566,11 +1575,18 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (bound === null) {
       throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected, { changed: ['detached'] })
     }
-    const detail = semanticTargetDiff(stored, bound, strictVisibility)
-    if (detail !== null) {
+    // tolerateContentName (within / retained scope-root only, never act):
+    // a name-only change on a content-named container is identity-exempt
+    // information — the aggregated name tracks descendant text while the
+    // element stays the same node — so the resolution proceeds and reports
+    // it via the nameChanged flag instead of refusing TARGET_CHANGED. Every
+    // other differing input, a label-named node, and every action target
+    // keep the strict refusal with the field-level diff attached.
+    const detail = semanticTargetDiff(stored, bound, strictVisibility, tolerateContentName)
+    if (detail !== null && detail.informational !== true) {
       throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected, detail)
     }
-    return { target: bound, handle }
+    return { target: bound, handle, ...(detail?.informational === true ? { nameChanged: true as const } : {}) }
   }
 
 

@@ -192,6 +192,9 @@ export interface BrowserCoverageEvidence {
   reason?: 'skipped' | 'over-budget' | 'cdp-unavailable' | 'root-unresolved' | 'error'
 }
 
+/** Where a node's accessible name comes from (v9+): an authored label, or descendant-text aggregation. */
+export type SemanticNameSource = 'label' | 'content'
+
 /** v8+: the root of a scoped observation, as the driver observed it. */
 export interface BrowserObservationScope {
   /** The ref the caller passed as within (v8 compatibility echo). */
@@ -211,6 +214,19 @@ export interface BrowserObservationScope {
   role: string
   name: string
   tag: string
+  /**
+   * v9+: present, and always true, when the resolved within root is a
+   * CONTENT-named container (see BrowserSemanticNode.nameSource) whose
+   * aggregated accessible name changed between the observation that minted
+   * the within ref and this scoped view. Such a name-only change is
+   * identity-exempt information — the root is the SAME element, so the
+   * scoped observation proceeds (never a TARGET_CHANGED refusal) — and
+   * `name` above carries the new aggregated name. Absent when the root is
+   * label-named, when no name change happened, and on every whole-page
+   * observe. `act` keeps the strict check: the same ref still refuses
+   * TARGET_CHANGED there.
+   */
+  nameChanged?: true
 }
 
 export interface BrowserSemanticNode {
@@ -238,6 +254,24 @@ export interface BrowserSemanticNode {
   parentRef: string | null
   role: string
   name: string
+  /**
+   * Where the accessible name came from, computed in the same single
+   * evaluation as `name`: 'label' when it is an authored label —
+   * aria-label, aria-labelledby, an associated <label>, alt, title, or
+   * another authored attribute/value (placeholder, an input-button's value)
+   * — and 'content' when it is derived from descendant text aggregation
+   * (or empty). A CONTENT-named node with a container role (search, region,
+   * list, listbox, group, navigation, main, form, table, menu — mirroring
+   * the QA layer's CONTENT_NAMED_CONTAINER_ROLES) has its `name` EXCLUDED
+   * from the within / retained scope-root identity check: its aggregated
+   * name changes with its descendants (a hide/show toggle flipping inside a
+   * Wikipedia-style "Part of a series" sidebar is the canonical case) while
+   * the element stays the same, so observe({ within: <its ref> }) resolves
+   * and reports the change informationally via scope.nameChanged instead of
+   * refusing TARGET_CHANGED. Label-named nodes, non-container nodes, and
+   * `act` targets keep the full strict fingerprint.
+   */
+  nameSource: SemanticNameSource
   tag: string
   interactive: boolean
   /**
@@ -592,6 +626,14 @@ export interface BrowserActionReceipt {
    * (role, name, tag, inputType, interactive, editable, disabled, visible,
    * download, href). A detached live element reports ['detached']. Values are
    * never inputs, so a value change alone never appears here.
+   *
+   * The within / retained scope-root resolution is the ONE comparison that
+   * exempts a name-only change on a content-named container (see
+   * BrowserSemanticNode.nameSource): there the scoped observation proceeds
+   * and reports scope.nameChanged instead of refusing, so no receipt field
+   * is produced. `act` targets always compare strictly, so an act receipt
+   * for a content-named container whose aggregated name changed still
+   * carries changed: ['name'].
    */
   changed?: string[]
   /** Present on a TARGET_CHANGED refusal: safe-subset snapshot BEFORE the change. */
