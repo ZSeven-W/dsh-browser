@@ -253,6 +253,28 @@ export interface BrowserSemanticNode {
    */
   parentRef: string | null
   role: string
+  /**
+   * The accessible name, derived by ONE normalization rule shared by every
+   * derivation path — the observation-time serializer and the live
+   * re-derivation used to re-resolve a ref — so the same element always
+   * yields byte-identical names and a static page can never trip the
+   * TARGET_CHANGED name check. The rule, in order:
+   * 1. zero-width / invisible format characters (U+200B-U+200F, U+2060 WORD
+   *    JOINER, U+00AD SOFT HYPHEN, U+00FEFF ZERO WIDTH NO-BREAK SPACE) are
+   *    stripped outright;
+   * 2. whitespace runs — including the no-break variants (U+00A0, U+2007,
+   *    U+202F, U+FEFF and the other Unicode space separators) — collapse to
+   *    a single space;
+   * 3. the result is trimmed;
+   * 4. then truncated at the fixed 180-character clamp, applied AFTER
+   *    normalization at a hard UTF-16 boundary;
+   * 5. then trimmed once more, so a truncation boundary landing on
+   *    whitespace can never leave a trailing space.
+   * Aggregation (when the source is 'content') concatenates the element's
+   * descendant textContent in document order with the browser's own
+   * separators, then normalizes the concatenation by the same rule. See
+   * nameSource below for which nodes aggregate contents.
+   */
   name: string
   /**
    * Where the accessible name came from, computed in the same single
@@ -319,10 +341,11 @@ export interface BrowserSemanticNode {
    * value was withheld — see `valueWithheld`. Never present together with
    * `valueWithheld`.
    *
-   * Values are attacker-influenced strings and are bounded exactly like `name`:
-   * whitespace runs are collapsed to single spaces, the string is trimmed, and
-   * the result is clipped to 180 characters. A consumer comparing an intended
-   * fill text against `value` must apply the same normalization.
+   * Values are attacker-influenced strings and are bounded the same way as
+   * `name` (see its comment for the rule): whitespace runs are collapsed to
+   * single spaces, the string is trimmed, and the result is clipped to 180
+   * characters. A consumer comparing an intended fill text against `value`
+   * must apply the same normalization.
    *
    * Like `inViewport`, the value fields are deliberately NOT part of the
    * identity fingerprint used to re-resolve a ref. A value change — typed,

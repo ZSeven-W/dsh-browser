@@ -89,6 +89,53 @@ export interface StoredSemanticTarget extends RawSemanticCandidate {
 const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' ').trim().slice(0, max)
 
 /**
+ * The ONE accessible-name normalization rule, shared by every derivation
+ * path — the observation-time serializer in collectSemanticTargets and the
+ * live re-derivation in inspectSemanticHandle — and by any other place that
+ * computes an accessible name. The two page-side serializers receive this
+ * function's own source text (normalizeAccessibleName.toString()) and
+ * re-instantiate it in-page, so both paths execute byte-identical logic; the
+ * observation path applies the same exported function a second time on the
+ * node side, and the function is idempotent, so the double application can
+ * never diverge from the single application on the live path (the QA-BL-074
+ * trailing-space bug was exactly that divergence: a truncation cut landing
+ * on whitespace left a trailing space on the single-application path, which
+ * the double application then trimmed away).
+ *
+ * Rule, in order:
+ * 1. Zero-width / invisible format characters — U+200B-U+200F, U+2060 WORD
+ *    JOINER, U+00AD SOFT HYPHEN, U+FEFF ZERO WIDTH NO-BREAK SPACE — are
+ *    stripped outright. They are not whitespace for \s, so without this step
+ *    they survive collapse and can join or separate words inconsistently.
+ * 2. Whitespace runs — including the no-break variants \s already matches
+ *    (U+00A0, U+2007, U+202F, U+FEFF and the other Unicode space
+ *    separators) — collapse to a single space.
+ * 3. The ends are trimmed.
+ * 4. The result is truncated at the fixed 180-character clamp, AFTER
+ *    normalization, at a hard UTF-16 slice boundary.
+ * 5. The truncated result is trimmed once more, so a cut landing on the
+ *    collapsed space after position 179 can never leave a trailing space.
+ *    This is the historical observation-time behavior (page-side
+ *    normalization plus the node-side re-compaction), which the live path
+ *    now matches exactly.
+ *
+ * Aggregation order and separators live in the accessibleName aggregation
+ * itself (descendant textContent in document order); this function only
+ * normalizes an already-aggregated candidate name.
+ */
+export function normalizeAccessibleName(value: string | null | undefined, max = 180): string {
+  return String(value ?? '')
+    .replace(/[\u200b-\u200f\u2060\u00ad\ufeff]+/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, max)
+    .trim()
+}
+
+/** Source text of the shared normalizer, injected into both page-side serializers. */
+const normalizeAccessibleNameSource: string = normalizeAccessibleName.toString()
+
+/**
  * Container roles whose accessible name the driver derives from CONTENTS
  * (concatenated descendant text) rather than an author-supplied label. Only
  * a node with one of these roles can carry an aggregated, order-dependent
@@ -357,6 +404,7 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       scanLimit: limit,
       maxNodes: nodeBudget,
       includeMatchIndex: withMatchIndex,
+      nameNormalizerSource,
       root: rootElement,
       anchor: anchorElement,
     } = args
@@ -364,6 +412,11 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       .replace(/\s+/gu, ' ')
       .trim()
       .slice(0, max)
+    // The ONE shared name-normalization rule (see normalizeAccessibleName),
+    // re-instantiated from its own source text so this serializer runs
+    // byte-identical logic to the live re-derivation in
+    // inspectSemanticHandle. The local normalize above stays for the role cap.
+    const normalizeName = (0, eval)('(' + nameNormalizerSource + ')') as (value: string | null | undefined, max?: number) => string
     const implicitRole = (element: Element): string => {
       const tag = element.tagName.toLowerCase()
       if (tag === 'a' && element.hasAttribute('href')) return 'link'
@@ -387,24 +440,24 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
         const joined = labelledBy.split(/\s+/u)
           .map((id) => document.getElementById(id)?.textContent ?? '')
           .join(' ')
-        if (normalize(joined)) return { name: normalize(joined), source: 'label' }
+        if (normalizeName(joined)) return { name: normalizeName(joined), source: 'label' }
       }
-      const aria = normalize(element.getAttribute('aria-label'))
+      const aria = normalizeName(element.getAttribute('aria-label'))
       if (aria) return { name: aria, source: 'label' }
       if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
         const labels = Array.from(element.labels ?? []).map((label) => label.textContent ?? '').join(' ')
-        if (normalize(labels)) return { name: normalize(labels), source: 'label' }
+        if (normalizeName(labels)) return { name: normalizeName(labels), source: 'label' }
       }
-      const alt = normalize(element.getAttribute('alt'))
+      const alt = normalizeName(element.getAttribute('alt'))
       if (alt) return { name: alt, source: 'label' }
-      const title = normalize(element.getAttribute('title'))
+      const title = normalizeName(element.getAttribute('title'))
       if (title) return { name: title, source: 'label' }
-      const placeholder = normalize(element.getAttribute('placeholder'))
+      const placeholder = normalizeName(element.getAttribute('placeholder'))
       if (placeholder) return { name: placeholder, source: 'label' }
-      if (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type) && normalize(element.value)) {
-        return { name: normalize(element.value), source: 'label' }
+      if (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type) && normalizeName(element.value)) {
+        return { name: normalizeName(element.value), source: 'label' }
       }
-      return { name: normalize(element.textContent), source: 'content' }
+      return { name: normalizeName(element.textContent), source: 'content' }
     }
     const selectorFor = (element: Element): string => {
       const parts: string[] = []
@@ -721,7 +774,7 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       ...(rootElement === undefined ? {} : { rootCandidate, rootEmittedIndex, rootRetained: rootElement }),
       ...(anchorElement === undefined ? {} : { anchorConnected, anchorContained, anchorIndex }),
     }
-  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex, root, anchor })
+  }, { selector: SEMANTIC_SELECTOR, scanLimit, maxNodes, includeMatchIndex, nameNormalizerSource: normalizeAccessibleNameSource, root, anchor })
 
   // Pull the serialized projection and the retained element array out of the
   // single capture handle, then materialize ElementHandles for ONLY those
@@ -786,7 +839,10 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     ...(typeof value.matchIndex === 'number' ? { matchIndex: Number(value.matchIndex) } : {}),
     parentIndex: typeof value.parentIndex === 'number' ? Number(value.parentIndex) : null,
     role: compact(String(value.role || 'generic'), 60),
-    name: compact(String(value.name || ''), 180),
+    // Second application of the shared normalizer (the page-side serializer
+    // applied it once already). It is idempotent by design, so this can never
+    // diverge from the single application on the live re-derivation path.
+    name: normalizeAccessibleName(String(value.name || '')),
     nameSource: value.nameSource === 'label' ? 'label' : 'content',
     tag: compact(String(value.tag || ''), 30),
     inputType: compact(String(value.inputType || ''), 30),
@@ -884,11 +940,16 @@ export async function inspectSemanticHandle(
   handle: ElementHandle<Element>,
   selector: string,
 ): Promise<RawSemanticCandidate | null> {
-  const value = await handle.evaluate((element) => {
+  const value = await handle.evaluate((element, nameNormalizerSource) => {
     const normalize = (raw: string | null | undefined, max = 180): string => String(raw ?? '')
       .replace(/\s+/gu, ' ')
       .trim()
       .slice(0, max)
+    // The ONE shared name-normalization rule (see normalizeAccessibleName),
+    // re-instantiated from its own source text so this live re-derivation
+    // runs byte-identical logic to the observation-time serializer in
+    // collectSemanticTargets. The local normalize above stays for the role cap.
+    const normalizeName = (0, eval)('(' + nameNormalizerSource + ')') as (value: string | null | undefined, max?: number) => string
     const implicitRole = (): string => {
       const tag = element.tagName.toLowerCase()
       if (tag === 'a' && element.hasAttribute('href')) return 'link'
@@ -912,24 +973,24 @@ export async function inspectSemanticHandle(
         const joined = labelledBy.split(/\s+/u)
           .map((id) => document.getElementById(id)?.textContent ?? '')
           .join(' ')
-        if (normalize(joined)) return { name: normalize(joined), source: 'label' }
+        if (normalizeName(joined)) return { name: normalizeName(joined), source: 'label' }
       }
-      const aria = normalize(element.getAttribute('aria-label'))
+      const aria = normalizeName(element.getAttribute('aria-label'))
       if (aria) return { name: aria, source: 'label' }
       if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
         const labels = Array.from(element.labels ?? []).map((label) => label.textContent ?? '').join(' ')
-        if (normalize(labels)) return { name: normalize(labels), source: 'label' }
+        if (normalizeName(labels)) return { name: normalizeName(labels), source: 'label' }
       }
-      const alt = normalize(element.getAttribute('alt'))
+      const alt = normalizeName(element.getAttribute('alt'))
       if (alt) return { name: alt, source: 'label' }
-      const title = normalize(element.getAttribute('title'))
+      const title = normalizeName(element.getAttribute('title'))
       if (title) return { name: title, source: 'label' }
-      const placeholder = normalize(element.getAttribute('placeholder'))
+      const placeholder = normalizeName(element.getAttribute('placeholder'))
       if (placeholder) return { name: placeholder, source: 'label' }
-      if (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type) && normalize(element.value)) {
-        return { name: normalize(element.value), source: 'label' }
+      if (element instanceof HTMLInputElement && ['button', 'submit', 'reset'].includes(element.type) && normalizeName(element.value)) {
+        return { name: normalizeName(element.value), source: 'label' }
       }
-      return { name: normalize(element.textContent), source: 'content' }
+      return { name: normalizeName(element.textContent), source: 'content' }
     }
     const safeHref = (): string | undefined => {
       const raw = element.getAttribute('href')
@@ -976,7 +1037,7 @@ export async function inspectSemanticHandle(
       download: element.hasAttribute('download'),
       ...(href === undefined ? {} : { href }),
     }
-  })
+  }, normalizeAccessibleNameSource)
   if (value === null) return null
   return { selector, ...value }
 }
