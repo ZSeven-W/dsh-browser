@@ -547,6 +547,19 @@ export type BrowserAction =
    */
   | { kind: 'hover'; ref: string }
 
+export interface TargetChangedSnapshot {
+  /** Observed role, present only when role is among the changed fields. */
+  role?: string
+  /** Observed accessible name, present only when name is among the changed fields. */
+  name?: string
+  /** Observed tag, present only when tag is among the changed fields. */
+  tag?: string
+  /** Observed disabled state, present only when disabled is among the changed fields. */
+  disabled?: boolean
+  /** Observed visibility gate state, present only when visible is among the changed fields. */
+  visible?: boolean
+}
+
 export interface BrowserActionReceipt {
   receiptId: string
   ownerId: string
@@ -573,6 +586,18 @@ export interface BrowserActionReceipt {
   }
   code?: string
   reason?: string
+  /**
+   * Present on a TARGET_CHANGED refusal: the identity inputs that differ
+   * between the observed node and the live element, in stable order
+   * (role, name, tag, inputType, interactive, editable, disabled, visible,
+   * download, href). A detached live element reports ['detached']. Values are
+   * never inputs, so a value change alone never appears here.
+   */
+  changed?: string[]
+  /** Present on a TARGET_CHANGED refusal: safe-subset snapshot BEFORE the change. */
+  before?: TargetChangedSnapshot
+  /** Present on a TARGET_CHANGED refusal: safe-subset snapshot AFTER the change. */
+  after?: TargetChangedSnapshot
 }
 
 export interface BrowserConsoleEvidence {

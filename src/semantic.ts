@@ -1,6 +1,6 @@
 import { createHash, createHmac } from 'node:crypto'
 import type { ElementHandle, JSHandle, Page } from 'playwright-core'
-import type { BrowserSemanticNode } from './driver-contract.js'
+import type { BrowserSemanticNode, TargetChangedSnapshot } from './driver-contract.js'
 
 export const SEMANTIC_SELECTOR = [
   'a[href]', 'button', 'input', 'textarea', 'select', 'summary',
@@ -34,6 +34,14 @@ export interface RawSemanticCandidate {
   interactive: boolean
   editable: boolean
   disabled: boolean
+  /**
+   * Whether the element passes the collection visibility gate (computed style
+   * is not display:none / visibility:hidden / opacity:0 and the rendered box
+   * is positive). Part of the identity fingerprint — unlike `inViewport`,
+   * which is the viewport intersection (a scroll-dependent fact) and
+   * deliberately not part of identity.
+   */
+  visible: boolean
   /** Whether the element's box intersects the viewport at collection time. Not part of the identity fingerprint. */
   inViewport: boolean
   download: boolean
@@ -70,7 +78,10 @@ const compact = (value: string, max = 180): string => value.replace(/\s+/gu, ' '
 
 /**
  * Identity fingerprint used to re-resolve a ref against the live DOM. It covers
- * only properties that answer "which element is this": `inViewport` (a
+ * only properties that answer "which element is this": role, name, tag,
+ * inputType, interactive/editable/disabled, the visibility gate state
+ * (`visible` — display/visibility/opacity/box facts, NOT the viewport
+ * intersection), download, and the credential-free href. `inViewport` (a
  * scroll-dependent fact) and the value fields (`value`, `valueWithheld`,
  * `valueTruncated` — fill-, keystroke-, or script-dependent facts) are
  * deliberately excluded, so a value change alone never invalidates a ref the
@@ -85,10 +96,59 @@ export function semanticFingerprint(candidate: RawSemanticCandidate): string {
     interactive: candidate.interactive,
     editable: candidate.editable,
     disabled: candidate.disabled,
+    visible: candidate.visible,
     download: candidate.download,
     href: candidate.href ?? '',
   }
   return createHash('sha256').update(JSON.stringify(stable)).digest('base64url').slice(0, 20)
+}
+
+/** Identity inputs compared on re-resolution, in the stable `changed` report order. */
+export const SEMANTIC_TARGET_FIELDS = [
+  'role', 'name', 'tag', 'inputType', 'interactive', 'editable', 'disabled', 'visible', 'download', 'href',
+] as const
+
+/** Fields whose before/after snapshots may attach to a TARGET_CHANGED refusal: the safe subset. */
+const SAFE_SNAPSHOT_FIELDS: ReadonlySet<string> = new Set(['role', 'name', 'tag', 'disabled', 'visible'])
+
+export interface TargetChangeDetail {
+  /** Identity inputs that differ, in stable order (a detached element reports `['detached']` instead). */
+  changed: string[]
+  /** Safe-subset snapshot of the OBSERVED candidate for every changed safe field. */
+  before?: TargetChangedSnapshot
+  /** Safe-subset snapshot of the LIVE element for every changed safe field. */
+  after?: TargetChangedSnapshot
+}
+
+/**
+ * Field-level difference between an observed candidate's identity inputs and a
+ * live re-inspection of the same bound node. `changed` lists every differing
+ * input in a stable order; `before`/`after` carry snapshots ONLY for the safe
+ * subset (role, name, tag, disabled, visible) — never inputType, interactive,
+ * editable, download, href, and never any value field (redaction rules
+ * unchanged). Returns null when the compared inputs match.
+ */
+export function semanticTargetDiff(observed: RawSemanticCandidate, live: RawSemanticCandidate, includeVisibility: boolean): TargetChangeDetail | null {
+  const changed: string[] = []
+  const before: TargetChangedSnapshot = {}
+  const after: TargetChangedSnapshot = {}
+  for (const field of SEMANTIC_TARGET_FIELDS) {
+    if (field === 'visible' && !includeVisibility) continue
+    const observedValue = field === 'href' ? (observed.href ?? '') : observed[field]
+    const liveValue = field === 'href' ? (live.href ?? '') : live[field]
+    if (observedValue !== liveValue) {
+      changed.push(field)
+      if (SAFE_SNAPSHOT_FIELDS.has(field)) {
+        ;(before as Record<string, string | boolean>)[field] = observedValue
+        ;(after as Record<string, string | boolean>)[field] = liveValue
+      }
+    }
+  }
+  if (changed.length === 0) return null
+  return {
+    changed,
+    ...(Object.keys(before).length === 0 ? {} : { before, after }),
+  }
 }
 
 export function opaqueRef(secret: Buffer, epoch: number, fingerprint: string, index: number): string {
@@ -482,10 +542,15 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
       const disabled = element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || nativeDisabled
       const rect = element.getBoundingClientRect()
       const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
+      // The identity visibility gate state, mirroring the emission gate exactly
+      // (including for a gate-excluded scope root serialized without the gate).
+      const style = getComputedStyle(element)
+      const visible = style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0
+        && rect.width > 0 && rect.height > 0 && element.getClientRects().length > 0
       const href = safeHref(element)
       return {
         selector: selectorFor(element), role, name: accessibleName(element), tag, inputType,
-        interactive, editable, disabled, inViewport,
+        interactive, editable, disabled, visible, inViewport,
         download: element.hasAttribute('download'),
         ...(href === undefined ? {} : { href }),
         ...observableValue(element, inputType),
@@ -660,6 +725,7 @@ export async function collectSemanticTargets(page: Page, options: SemanticCollec
     interactive: value.interactive === true,
     editable: value.editable === true,
     disabled: value.disabled === true,
+    visible: value.visible === true,
     inViewport: value.inViewport === true,
     download: value.download === true,
     ...(typeof value.href === 'string' ? { href: compact(value.href, 500) } : {}),
@@ -823,6 +889,10 @@ export async function inspectSemanticHandle(
     const href = safeHref()
     const rect = element.getBoundingClientRect()
     const inViewport = rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight
+    // Same identity visibility gate state as the collection serializer.
+    const style = getComputedStyle(element)
+    const visible = style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0
+      && rect.width > 0 && rect.height > 0 && element.getClientRects().length > 0
     return {
       role,
       name: accessibleName(),
@@ -831,6 +901,7 @@ export async function inspectSemanticHandle(
       interactive,
       editable,
       disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' || nativeDisabled,
+      visible,
       inViewport,
       download: element.hasAttribute('download'),
       ...(href === undefined ? {} : { href }),

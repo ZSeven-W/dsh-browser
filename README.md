@@ -88,7 +88,7 @@ Injected `storageState` is validated the same way: every `localStorage` origin m
 
 - Live target semantics—not a model-provided “sensitive” flag—reject destructive, financial, send/publish, security-change, password, upload, and download actions.
 - Refs are opaque HMAC-derived values and only the latest unexpired observation is actionable.
-- The driver re-collects live semantics and requires the same fingerprint, then center-point hit-tests before target actions.
+- The driver re-collects live semantics and requires the same fingerprint, then center-point hit-tests before target actions. A `TARGET_CHANGED` refusal carries `changed` (the identity fields that differ, e.g. `['name']`, `['visible']`, or `['detached']`) plus `before`/`after` snapshots for the safe subset (`role`, `name`, `tag`, `disabled`, `visible`) — never any value.
 - Downloads are cancelled and JavaScript dialogs are dismissed.
 - Console text is bounded and common credential patterns are redacted.
 - Network evidence contains method, status/failure, resource type, and a URL without credentials/query/fragment; it never includes headers or bodies.

@@ -25,6 +25,7 @@ import type {
   BrowserVisualMark,
   BrowserVisualObserveRequest,
   BrowserVisualOmission,
+  TargetChangedSnapshot,
   ZSevenBrowserDriver,
 } from './driver-contract.js'
 import { BROWSER_DRIVER_CONTRACT_VERSION } from './driver-contract.js'
@@ -36,6 +37,7 @@ import {
   opaqueRef,
   publicSemanticNode,
   semanticFingerprint,
+  semanticTargetDiff,
   type RawSemanticCandidate,
   type StoredSemanticTarget,
 } from './semantic.js'
@@ -198,9 +200,20 @@ interface ManagedSession {
 }
 
 class DriverIssue extends Error {
-  constructor(readonly code: string, message: string, readonly rejected: boolean) {
+  readonly changed: string[] | undefined
+  readonly before: TargetChangedSnapshot | undefined
+  readonly after: TargetChangedSnapshot | undefined
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly rejected: boolean,
+    detail?: { changed?: string[]; before?: TargetChangedSnapshot; after?: TargetChangedSnapshot },
+  ) {
     super(message)
     this.name = 'DriverIssue'
+    this.changed = detail?.changed
+    this.before = detail?.before
+    this.after = detail?.after
   }
 }
 
@@ -625,7 +638,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
           resolved.handle.evaluate((element) => element.nodeType),
         ).catch((error: unknown) => {
           if (error instanceof DriverIssue) throw error
-          if (isDetachedElementError(error)) throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true)
+          if (isDetachedElementError(error)) throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true, { changed: ['detached'] })
           throw error
         })
         if (nodeType !== 1) {
@@ -653,14 +666,14 @@ export class BrowserManager implements ZSevenBrowserDriver {
           if (error instanceof DriverIssue) throw error
           // A document replacement between resolution and collection destroys
           // the root's execution context; fail closed, never fall back.
-          if (isDetachedElementError(error)) throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true)
+          if (isDetachedElementError(error)) throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true, { changed: ['detached'] })
           throw error
         })
       }
       let scan = await collect()
       const refuseRoot = (failure: NonNullable<typeof scan.rootFailure>): never => {
         if (failure === 'not-element') throw new DriverIssue('WITHIN_NOT_ELEMENT', 'the within ref resolved to a non-element DOM node; scoped observation requires an element', true)
-        throw new DriverIssue('TARGET_CHANGED', 'the within element detached from the document before collection; observe again', true)
+        throw new DriverIssue('TARGET_CHANGED', 'the within element detached from the document before collection; observe again', true, { changed: ['detached'] })
       }
       if (scan.rootFailure !== undefined) refuseRoot(scan.rootFailure)
       // Only a document replacement between the serializing evaluation and the
@@ -1039,6 +1052,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
       let status: BrowserActionReceipt['status'] = 'failed'
       let code: string | undefined
       let reason: string | undefined
+      let changed: string[] | undefined
+      let before: TargetChangedSnapshot | undefined
+      let after: TargetChangedSnapshot | undefined
 
       try {
         if (!action || !['click', 'fill', 'press', 'navigate', 'scroll', 'select', 'hover'].includes(action.kind)) {
@@ -1256,6 +1272,11 @@ export class BrowserManager implements ZSevenBrowserDriver {
           status = error.rejected && !dispatched ? 'rejected' : (dispatched ? 'unknown' : 'failed')
           code = error.code
           reason = error.message
+          // The TARGET_CHANGED field-level diff rides the receipt verbatim;
+          // every other issue carries none of these fields.
+          changed = error.changed
+          before = error.before
+          after = error.after
         } else if (signal?.aborted) {
           status = dispatched ? 'unknown' : 'rejected'
           code = 'CANCELLED'
@@ -1345,6 +1366,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
         ...(verification === undefined ? {} : { verification }),
         ...(code === undefined ? {} : { code }),
         ...(reason === undefined ? {} : { reason }),
+        ...(changed === undefined ? {} : { changed }),
+        ...(before === undefined ? {} : { before }),
+        ...(after === undefined ? {} : { after }),
       }
     }).catch(async (error: unknown) => {
       const summary = session && !session.closed ? await pageSummary(session.page) : fallbackPage
@@ -1355,6 +1379,9 @@ export class BrowserManager implements ZSevenBrowserDriver {
         dispatched: false, pageBefore: summary, pageAfter: summary,
         code: issue?.code ?? 'BROWSER_OPERATION_FAILED',
         reason: compact(issue?.message ?? (error instanceof Error ? error.message : String(error)), 500),
+        ...(issue?.changed === undefined ? {} : { changed: issue.changed }),
+        ...(issue?.before === undefined ? {} : { before: issue.before }),
+        ...(issue?.after === undefined ? {} : { after: issue.after }),
       }
     })
   }
@@ -1453,7 +1480,10 @@ export class BrowserManager implements ZSevenBrowserDriver {
     const isAlias = ref === LAST_SCOPE_ALIAS
     const matchesRetained = retained !== undefined && ref === retained.rootRef
     if (!isAlias && !matchesRetained) {
-      if (observation !== undefined) return this.#resolveTarget(session, ref, signal, true)
+      // A within resolution tolerates a visibility-only change (see the
+      // retained-root check below); every other identity input refuses with
+      // the field-level diff attached.
+      if (observation !== undefined) return this.#resolveTarget(session, ref, signal, true, false)
       throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', true)
     }
     if (observation !== undefined) {
@@ -1483,11 +1513,19 @@ export class BrowserManager implements ZSevenBrowserDriver {
       throw new DriverIssue('SCOPE_UNAVAILABLE', 'the retained scope root belonged to a document that no longer exists; observe again', true)
     }
     if (!connected) {
-      throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true)
+      throw new DriverIssue('TARGET_CHANGED', 'the within element was removed from the page; observe again', true, { changed: ['detached'] })
     }
     const bound = await inspectSemanticHandle(handle, retained.target.selector).catch(() => null)
-    if (!bound || semanticFingerprint(bound) !== retained.target.fingerprint) {
-      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', true)
+    if (bound === null) {
+      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', true, { changed: ['detached'] })
+    }
+    // The within path tolerates a visibility-only change: a root that became
+    // hidden between observations must still resolve and keep binding (the
+    // gate then honestly excludes it from nodes — see the hidden-root scope
+    // retention flow).
+    const detail = semanticTargetDiff(retained.target, bound, false)
+    if (detail !== null) {
+      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', true, detail)
     }
     return { target: bound, handle }
   }
@@ -1499,7 +1537,7 @@ export class BrowserManager implements ZSevenBrowserDriver {
     if (handle !== undefined) void handle.dispose().catch(() => {})
   }
 
-  async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal, failureRejected = true): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
+  async #resolveTarget(session: ManagedSession, ref: string, signal?: AbortSignal, failureRejected = true, strictVisibility = true): Promise<{ target: RawSemanticCandidate; handle: ElementHandle<Element> }> {
     const observation = session.observation
     if (!observation) throw new DriverIssue('OBSERVATION_REQUIRED', 'call browser_observe and use a ref from the latest observation', failureRejected)
     if (this.#now() > observation.expiresAtMs) throw new DriverIssue('REF_EXPIRED', 'the semantic ref expired; observe again', failureRejected)
@@ -1522,11 +1560,15 @@ export class BrowserManager implements ZSevenBrowserDriver {
     }
     const connected = await this.#abortClosesSession(session, signal, handle.evaluate((element) => element.isConnected)).catch(() => false)
     if (!connected) {
-      throw new DriverIssue('TARGET_CHANGED', 'the element the ref denotes was removed from the page; observe again', failureRejected)
+      throw new DriverIssue('TARGET_CHANGED', 'the element the ref denotes was removed from the page; observe again', failureRejected, { changed: ['detached'] })
     }
     const bound = await inspectSemanticHandle(handle, stored.selector).catch(() => null)
-    if (!bound || semanticFingerprint(bound) !== stored.fingerprint) {
-      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected)
+    if (bound === null) {
+      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected, { changed: ['detached'] })
+    }
+    const detail = semanticTargetDiff(stored, bound, strictVisibility)
+    if (detail !== null) {
+      throw new DriverIssue('TARGET_CHANGED', 'the live element no longer matches the observed semantic fingerprint', failureRejected, detail)
     }
     return { target: bound, handle }
   }

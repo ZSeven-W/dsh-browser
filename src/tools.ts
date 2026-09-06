@@ -139,6 +139,21 @@ const actionReceiptSchema = closedObject({
   }),
   code: { type: 'string' },
   reason: { type: 'string' },
+  changed: { type: 'array', items: { type: 'string' } },
+  before: closedObject({
+    role: { type: 'string' },
+    name: { type: 'string' },
+    tag: { type: 'string' },
+    disabled: { type: 'boolean' },
+    visible: { type: 'boolean' },
+  }, []),
+  after: closedObject({
+    role: { type: 'string' },
+    name: { type: 'string' },
+    tag: { type: 'string' },
+    disabled: { type: 'boolean' },
+    visible: { type: 'boolean' },
+  }, []),
 }, [
   'receiptId', 'ownerId', 'action', 'status', 'startedAt', 'completedAt',
   'dispatched', 'pageBefore', 'pageAfter',
@@ -252,7 +267,7 @@ export function createBrowserTools(driver: ZSevenBrowserDriver): BrowserTools {
     option?: string
   }, BrowserActionReceipt>({
     name: 'browser_act',
-    description: 'Perform exactly one browser action. click/fill/press/scroll(ref)/select/hover require a ref from the latest browser_observe; the driver acts on the original observed DOM node and re-verifies its identity (removal or replacement rejects, never a silent click on a lookalike), then hit-tests it (scroll resolves without a hit-test so it can reach off-viewport targets; an off-viewport click rejects TARGET_OFF_VIEWPORT). scroll(direction) pages the viewport without a ref. select fires real input/change events and matches an option by accessible label first and exact value second, failing (not guessing) when ambiguous or missing. Every dispatched action invalidates the observation, so observe again after acting. Deterministic policy rejects destructive, financial, publish/send, credential, file-upload, and download semantics. Every call returns a confirmed/unknown/rejected/failed receipt.',
+    description: 'Perform exactly one browser action. click/fill/press/scroll(ref)/select/hover require a ref from the latest browser_observe; the driver acts on the original observed DOM node and re-verifies its identity (removal or replacement rejects, never a silent click on a lookalike), then hit-tests it (scroll resolves without a hit-test so it can reach off-viewport targets; an off-viewport click rejects TARGET_OFF_VIEWPORT). A TARGET_CHANGED refusal carries `changed` (the identity fields that differ, e.g. [\'name\'] or [\'visible\'] when the target became display:none, [\'detached\'] when it was removed) plus `before`/`after` snapshots for the safe subset (role, name, tag, disabled, visible) — never any value. scroll(direction) pages the viewport without a ref. select fires real input/change events and matches an option by accessible label first and exact value second, failing (not guessing) when ambiguous or missing. Every dispatched action invalidates the observation, so observe again after acting. Deterministic policy rejects destructive, financial, publish/send, credential, file-upload, and download semantics. Every call returns a confirmed/unknown/rejected/failed receipt.',
     parameters: {
       type: 'object',
       additionalProperties: false,

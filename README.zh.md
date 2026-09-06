@@ -86,7 +86,7 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 
 - 不相信模型传入的敏感标记，而是根据实时目标语义拒绝删除、付款、发送/发布、安全设置、密码、上传和下载动作。
 - Ref 是 HMAC 派生的 opaque 值，只有最新且未过期的一次观察可操作。
-- 操作前重新采集语义并核对 fingerprint，再做中心点 Hit Test。
+- 操作前重新采集语义并核对 fingerprint，再做中心点 Hit Test。`TARGET_CHANGED` 拒绝会携带 `changed`（发生变化的身份字段，如 `['name']`、`['visible']` 或 `['detached']`）以及安全子集（`role`、`name`、`tag`、`disabled`、`visible`）的 `before`/`after` 快照——绝不包含任何值。
 - 自动取消下载，自动关闭 JavaScript Dialog。
 - Console 有数量和长度上限，并对常见凭据模式脱敏。
 - Network 仅返回 method、status/failure、resource type 和去掉凭据、query、fragment 的 URL，不返回 header 或 body。
