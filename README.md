@@ -1,12 +1,28 @@
-# dsh-browser
+<h1 align="center">DSH Browser</h1>
 
-English · [简体中文](README.zh.md)
+<p align="center">
+  <strong>Headless-first, isolated browser automation for DeepSeek Harness.</strong><br />
+  <sub>Managed Chromium Sessions &bull; Semantic References &bull; Scoped Observation &bull; Bounded Evidence</sub>
+</p>
 
-Headless-first managed Browser Use for DeepSeek Harness. Each Agent gets its own temporary Chrome/Edge/Chromium user-data directory, short-lived semantic references, deterministic high-risk rejection, and bounded evidence.
+<p align="center">
+  <sub>Package: <code>@zseven-w/dsh-browser</code> &middot; Checkout version: <code>0.1.0-rc.1</code> &middot; Prerelease</sub>
+</p>
 
-Current version: `0.1.0-rc.1`. This checkout is local development work and has not been published to npm.
+<p align="center">
+  <a href="./README.md"><b>English</b></a> &middot; <a href="./README.zh.md">简体中文</a>
+</p>
 
-## Why this shape
+Each Agent gets its own temporary Chrome/Edge/Chromium user-data directory, short-lived semantic references, deterministic high-risk rejection, and bounded evidence. These instructions describe the local checkout; they do not assume an npm release is available.
+
+[Quick start](#quick-start) · [Tools](#tools) · [Safety](#safety-and-evidence-boundaries) · [Development](#develop-locally) · [Documentation](#documentation)
+
+<p align="center">
+  <img src="./docs/images/dsh-browser-demo.png" alt="DSH Browser fills a synthetic release form and observes PASS on a local test page" width="100%" />
+</p>
+<p align="center"><sub>Real Browser driver execution on a styled local test fixture: fill → click → re-observe. Synthetic data only; this is the page under test, not a built-in plugin dashboard.</sub></p>
+
+## Why DSH Browser
 
 `dsh-browser` does not attach to your personal browser or expose CSS selectors to the model. A tool call is always scoped by `exec.agent.id`; an Agent can only observe and act in the browser context it owns.
 
@@ -17,6 +33,27 @@ Agent B ── ephemeral Chromium context B ── opaque refs B
 ```
 
 The exported `zsevenBrowserDriver` service is the stable orchestration surface intended for `dsh-qa`.
+
+## Quick start
+
+Requirements: Node.js `>=24.11.0`, pnpm, and an installed Google Chrome, Microsoft Edge, or Chromium. The default path is headless; no personal browser profile is used.
+
+Install DSH separately, then build this checkout from the repository root:
+
+```sh
+npm install -g @deepseek-ai/dsh@latest
+pnpm install
+pnpm run build
+```
+
+Link the built checkout into a DSH Web profile, replacing the placeholder with its absolute path, then restart DSH:
+
+```sh
+dsh plugin --profile web add link:/path/to/dsh-browser
+dsh web
+```
+
+Set an operator-owned [navigation allowlist](#operator-navigation-policy) before running against production or QA targets. Start with `browser_session_start`, call `browser_observe`, act using a fresh ref, then observe again to check the result. Finish with `browser_session_stop`. A `confirmed` action receipt proves dispatch, not the application's business outcome.
 
 ## Tools
 
@@ -108,7 +145,7 @@ pnpm test
 pnpm run smoke:pack
 ```
 
-Link or install this directory through the normal DSH local-plugin workflow; no remote repository or registry package is created by this checkout.
+Use the [quick-start local link](#quick-start) to load the built checkout into DSH. Build and test commands do not publish a registry package.
 
 ## Exported driver contract
 
@@ -135,6 +172,14 @@ Initial limitations are intentional and should not be read as claims:
 - Headless mode is the accepted path; the available headful option has not received the same integration coverage.
 - Risk matching is a deterministic deny layer, not a complete user-approval system. Higher-level QA workflows still need their own authorization policy.
 
+## Documentation
+
+- [简体中文](README.zh.md) — Chinese edition of this guide.
+- [Driver contract](#exported-driver-contract) and [TypeScript definitions](src/driver-contract.ts) — integration surface for orchestration consumers.
+- [Scoped observation](#scoped-observation-v8), [identity and ancestry](#identity-and-ancestry-v9), and [coverage boundaries](#verified-boundaries-v9-phase-c) — reference lifetime and absence-proof semantics.
+- [Verified scope and current limitations](#verified-scope-and-current-limitations) — what the integration gates cover and what they do not claim.
+- [Third-party notices](THIRD_PARTY_NOTICES.md).
+
 ## License
 
-MIT
+[MIT](LICENSE)

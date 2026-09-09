@@ -1,10 +1,26 @@
-# dsh-browser
+<h1 align="center">DSH Browser</h1>
 
-[English](README.md) · 简体中文
+<p align="center">
+  <strong>面向 DeepSeek Harness、优先无头运行的隔离式浏览器自动化。</strong><br />
+  <sub>托管 Chromium 会话 &bull; 语义引用 &bull; 限定范围观察 &bull; 有界证据</sub>
+</p>
 
-面向 DeepSeek Harness 的 Headless-first 托管式 Browser Use。每个 Agent 独占一个临时 Chrome / Edge / Chromium 用户目录，并通过短期语义引用、确定性高风险拦截和有界证据进行操作。
+<p align="center">
+  <sub>包名：<code>@zseven-w/dsh-browser</code> &middot; 工作区版本：<code>0.1.0-rc.1</code> &middot; 预发布阶段</sub>
+</p>
 
-当前版本：`0.1.0-rc.1`。这是本地开发版本，尚未发布到 npm。
+<p align="center">
+  <a href="./README.md">English</a> &middot; <a href="./README.zh.md"><b>简体中文</b></a>
+</p>
+
+每个 Agent 独占一个临时 Chrome / Edge / Chromium 用户目录，并通过短期语义引用、确定性高风险拦截和有界证据进行操作。本文描述本地工作区，不以 npm 上已有可用发布包为前提。
+
+[快速开始](#快速开始) · [工具](#工具) · [安全边界](#安全与证据边界) · [本地开发](#本地开发) · [文档入口](#文档入口)
+
+<p align="center">
+  <img src="./docs/images/dsh-browser-demo.png" alt="DSH Browser 在本地测试页面填写合成版本信息，点击验证并观察到 PASS" width="100%" />
+</p>
+<p align="center"><sub>Browser 驱动真实执行填写 → 点击 → 重新观察。画面是增加展示样式的本地测试页面，不是插件自带面板；全部使用合成数据。</sub></p>
 
 ## 产品边界
 
@@ -18,7 +34,28 @@ Agent B ── 临时 Chromium Context B ── opaque refs B
 
 插件同时提供 `zsevenBrowserDriver` 服务，作为后续 `dsh-qa` 的稳定编排接口。
 
-## 五个工具
+## 快速开始
+
+需要 Node.js `>=24.11.0`、pnpm，以及已安装的 Google Chrome、Microsoft Edge 或 Chromium。默认使用 Headless，不使用个人浏览器 Profile。
+
+单独安装 DSH，然后在本仓库根目录构建：
+
+```sh
+npm install -g @deepseek-ai/dsh@latest
+pnpm install
+pnpm run build
+```
+
+将已构建的工作区链接到 DSH Web Profile：把占位路径替换为本仓库的绝对路径，然后重启 DSH。
+
+```sh
+dsh plugin --profile web add link:/path/to/dsh-browser
+dsh web
+```
+
+用于生产或 QA 目标前，先配置 Operator 管理的[导航白名单](#operator-导航白名单)。依次调用 `browser_session_start`、`browser_observe`，使用新鲜 ref 执行动作，然后重新观察验证结果；结束时调用 `browser_session_stop`。`confirmed` 收据只证明输入已派发，不代表业务结果成功。
+
+## 工具
 
 | 工具 | 作用 |
 | --- | --- |
@@ -106,7 +143,7 @@ pnpm test
 pnpm run smoke:pack
 ```
 
-通过 DSH 常规的本地插件流程链接或安装此目录；此版本不会创建远程仓库，也不会发布 registry 包。
+通过[快速开始](#快速开始)中的本地链接方式将构建结果载入 DSH。构建和测试命令不会发布 registry 包。
 
 ## Driver Contract
 
@@ -133,6 +170,14 @@ import {
 - 已验收路径是 Headless；Headful 参数存在，但尚未获得同等集成覆盖。
 - 确定性风险匹配只是拒绝层，不是完整的用户审批系统；上层 QA 工作流仍需自己的授权策略。
 
-## License
+## 文档入口
 
-MIT
+- [English](README.md) — 本指南的英文版本。
+- [Driver Contract](#driver-contract) 与 [TypeScript 定义](src/driver-contract.ts) — 面向编排消费方的集成接口。
+- [限定范围观察](#限定范围观察v8)、[身份与祖先链](#身份与祖先链v9)及[已验证边界](#已验证边界v9-phase-c) — 引用生命周期与“不存在”证明的语义。
+- [已验证范围与限制](#已验证范围与限制) — 集成门禁的覆盖范围与未覆盖项。
+- [第三方声明](THIRD_PARTY_NOTICES.md)。
+
+## 许可证
+
+[MIT](LICENSE)
