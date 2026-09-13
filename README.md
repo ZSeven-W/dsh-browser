@@ -135,7 +135,7 @@ Injected `storageState` is validated the same way: every `localStorage` origin m
 
 ## Develop locally
 
-Requirements: Node.js `>=24.11.0`, pnpm, and an installed Google Chrome, Microsoft Edge, or Chromium. `DSH_BROWSER_EXECUTABLE_PATH` is an operator-only override for a non-standard executable location.
+Requirements: Node.js `>=24.11.0`, pnpm, and an installed Google Chrome, Microsoft Edge, or Chromium. `DSHPLUGIN_BROWSER_EXECUTABLE_PATH` is an operator-only override for a non-standard executable location.
 
 ```sh
 pnpm install

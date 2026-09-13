@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { browserCandidates } from '../lib/index.js'
 
 test('browser discovery covers Chrome, Edge, Chromium and operator override on macOS', () => {
-  const rows = browserCandidates({ platform: 'darwin', home: '/Users/tester', env: { DSH_BROWSER_EXECUTABLE_PATH: '/opt/browser' } })
+  const rows = browserCandidates({ platform: 'darwin', home: '/Users/tester', env: { DSHPLUGIN_BROWSER_EXECUTABLE_PATH: '/opt/browser' } })
   assert.deepEqual(rows[0], { path: '/opt/browser', channel: 'custom' })
   assert.ok(rows.some((row) => row.channel === 'chrome'))
   assert.ok(rows.some((row) => row.channel === 'edge'))

@@ -133,7 +133,7 @@ dsh web
 
 ## 本地开发
 
-需要 Node.js `>=24.11.0`、pnpm，以及已安装的 Google Chrome、Microsoft Edge 或 Chromium。非标准安装位置可由 Operator 设置 `DSH_BROWSER_EXECUTABLE_PATH`。
+需要 Node.js `>=24.11.0`、pnpm，以及已安装的 Google Chrome、Microsoft Edge 或 Chromium。非标准安装位置可由 Operator 设置 `DSHPLUGIN_BROWSER_EXECUTABLE_PATH`。
 
 ```sh
 pnpm install

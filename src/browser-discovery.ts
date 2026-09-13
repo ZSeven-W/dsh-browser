@@ -2,6 +2,10 @@ import { constants } from 'node:fs'
 import { access, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, win32 } from 'node:path'
+import { pluginEnv, pluginEnvName } from './plugin-env.js'
+
+/** Suffix of the operator-only executable-path override (see plugin-env.ts). */
+export const BROWSER_EXECUTABLE_PATH_ENV_SUFFIX = 'BROWSER_EXECUTABLE_PATH'
 
 export type BrowserChannel = 'chrome' | 'edge' | 'chromium' | 'custom'
 
@@ -22,7 +26,7 @@ export function browserCandidates(input: BrowserDiscoveryInput = {}): BrowserExe
   const env = input.env ?? process.env
   const home = input.home ?? homedir()
   const candidates: BrowserExecutable[] = []
-  const override = env.DSH_BROWSER_EXECUTABLE_PATH?.trim()
+  const override = pluginEnv(BROWSER_EXECUTABLE_PATH_ENV_SUFFIX, { env })?.trim()
   if (override) candidates.push({ path: override, channel: 'custom' })
 
   if (platform === 'darwin') {
@@ -79,6 +83,6 @@ export async function discoverInstalledBrowser(input: BrowserDiscoveryInput = {}
   }
   throw new Error(
     'No supported browser executable was found. Install Google Chrome, Microsoft Edge, or Chromium; '
-      + 'operators may set DSH_BROWSER_EXECUTABLE_PATH to an absolute browser executable.',
+      + `operators may set ${pluginEnvName(BROWSER_EXECUTABLE_PATH_ENV_SUFFIX)} to an absolute browser executable.`,
   )
 }
