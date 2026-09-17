@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <sub>包名：<code>@zseven-w/dsh-browser</code> &middot; 工作区版本：<code>0.1.0-rc.1</code> &middot; 预发布阶段</sub>
+  <sub>包名：<code>@zseven-w/dsh-browser</code> &middot; 版本：<code>0.1.0-rc.1</code> &middot; 预发布阶段</sub>
 </p>
 
 <p align="center">
   <a href="./README.md">English</a> &middot; <a href="./README.zh.md"><b>简体中文</b></a>
 </p>
 
-每个 Agent 独占一个临时 Chrome / Edge / Chromium 用户目录，并通过短期语义引用、确定性高风险拦截和有界证据进行操作。本文描述本地工作区，不以 npm 上已有可用发布包为前提。
+每个 Agent 独占一个临时 Chrome / Edge / Chromium 用户目录，并通过短期语义引用、确定性高风险拦截和有界证据进行操作。用 `npm install @zseven-w/dsh-browser` 安装；当前是预发布版本，契约（v9）在 rc 之间仍可能变化。
 
 [快速开始](#快速开始) · [工具](#工具) · [安全边界](#安全与证据边界) · [本地开发](#本地开发) · [文档入口](#文档入口)
 

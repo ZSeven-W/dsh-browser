@@ -3,6 +3,14 @@
   "version": "0.1.0-rc.1",
   "description": "Headless-first managed Browser Use for DeepSeek Harness with isolated sessions, semantic refs, deterministic safety checks, and bounded evidence",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZSeven-W/dsh-browser.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZSeven-W/dsh-browser/issues"
+  },
+  "homepage": "https://github.com/ZSeven-W/dsh-browser#readme",
   "type": "module",
   "packageManager": "pnpm@10.34.5",
   "publishConfig": {

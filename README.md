@@ -6,14 +6,14 @@
 </p>
 
 <p align="center">
-  <sub>Package: <code>@zseven-w/dsh-browser</code> &middot; Checkout version: <code>0.1.0-rc.1</code> &middot; Prerelease</sub>
+  <sub>Package: <code>@zseven-w/dsh-browser</code> &middot; Version: <code>0.1.0-rc.1</code> &middot; Prerelease</sub>
 </p>
 
 <p align="center">
   <a href="./README.md"><b>English</b></a> &middot; <a href="./README.zh.md">简体中文</a>
 </p>
 
-Each Agent gets its own temporary Chrome/Edge/Chromium user-data directory, short-lived semantic references, deterministic high-risk rejection, and bounded evidence. These instructions describe the local checkout; they do not assume an npm release is available.
+Each Agent gets its own temporary Chrome/Edge/Chromium user-data directory, short-lived semantic references, deterministic high-risk rejection, and bounded evidence. Install it with `npm install @zseven-w/dsh-browser`; this is a prerelease, so the contract (v9) can still change between rc versions.
 
 [Quick start](#quick-start) · [Tools](#tools) · [Safety](#safety-and-evidence-boundaries) · [Development](#develop-locally) · [Documentation](#documentation)
 
